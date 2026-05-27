@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MyCast — Personal AI Podcast Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=DM+Sans:wght@300;400;500&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css" />
+  <link rel="stylesheet" href="/css/app.css" />
+  <link rel="icon" type="image/png" href="/logo.png" />
+</head>
+<body>
+<div id="app">
+  <div id="screen-setup" class="screen active">
+    <div class="bg-fx"><div class="grain"></div><div class="glow g1"></div><div class="glow g2"></div></div>
+    <header class="hdr">
+      <div class="logo"><div class="logo-icon"><img src="/logo.png" alt="MyCast" class="logo-img"/></div><span class="logo-text">MyCast</span><span class="badge">Beta</span></div>
+    </header>
+    <main class="setup-main">
+      <div class="hero">
+        <h1 class="hero-title">Your knowledge,<br/><em>on demand.</em></h1>
+        <p class="hero-sub">Tell us what you want to master. We'll build your personal podcast series — crafted just for you, voiced by AI.</p>
+      </div>
+      <div class="setup-form">
+        <div class="field">
+          <label class="field-label"><i class="ti ti-search"></i> What do you want to learn?</label>
+          <input type="text" id="topic" class="input" placeholder="e.g. Mastering negotiation, Home building, History of Jazz…" autocomplete="off" />
+        </div>
+        <div class="options-grid">
+          <div class="option-card">
+            <div class="option-label"><i class="ti ti-clock"></i> Episode length</div>
+            <div class="radio-group">
+              <label class="radio-item"><input type="radio" name="length" value="5"><span class="rc"></span><span class="rt"><strong>5 min</strong> Quick hit</span></label>
+              <label class="radio-item"><input type="radio" name="length" value="10" checked><span class="rc"></span><span class="rt"><strong>10 min</strong> Standard</span></label>
+              <label class="radio-item"><input type="radio" name="length" value="20"><span class="rc"></span><span class="rt"><strong>20 min</strong> Deep dive</span></label>
+              <label class="radio-item"><input type="radio" name="length" value="ai"><span class="rc"></span><span class="rt"><strong>AI decides</strong></span></label>
+            </div>
+          </div>
+          <div class="option-card">
+            <div class="option-label"><i class="ti ti-microphone"></i> Voice</div>
+            <div class="radio-group" id="voice-radio-group"><div class="loading-voices">Loading voices…</div></div>
+          </div>
+        </div>
+        <div id="setup-error" class="error-msg" style="display:none"></div>
+        <button class="btn-generate" id="btn-generate" onclick="App.generate()">
+          <i class="ti ti-sparkles"></i><span>Generate my podcast</span><div class="btn-shimmer"></div>
+        </button>
+      </div>
+    </main>
+  </div>
+  <div
