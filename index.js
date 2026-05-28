@@ -63,10 +63,18 @@ app.post('/api/synthesize', async (req, res) => {
       headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
       body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
     });
+    console.log('ElevenLabs status:', r.status);
+    if (!r.ok) {
+      const errText = await r.text();
+      console.log('ElevenLabs error:', errText);
+      return res.status(500).json({ error: 'ElevenLabs error: ' + errText });
+    }
     const buf = await r.arrayBuffer();
+    console.log('Audio buffer size:', buf.byteLength);
     res.set('Content-Type', 'audio/mpeg');
     res.send(Buffer.from(buf));
   } catch (e) {
+    console.log('Synthesize exception:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
