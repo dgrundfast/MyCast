@@ -28,7 +28,7 @@ app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 10 : parseInt(episodeLength);
-  const prompt = `You are MyCast. User wants to learn: "${topic}". Create a 5-episode podcast series. Return ONLY valid JSON: {"series_title":"","series_subtitle":"","episodes":[{"episode_number":1,"title":"","duration_minutes":${mins},"teaser":"","script":""}]}`;
+  const prompt = `You are MyCast. User wants to learn: "${topic}". Create a 5-episode podcast series. Return ONLY valid JSON with no markdown and no code fences: {"series_title":"","series_subtitle":"","episodes":[{"episode_number":1,"title":"","duration_minutes":${mins},"teaser":"","script":"full engaging educational script here"}]}. Make all 5 episodes with rich detailed scripts.`;
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -36,9 +36,14 @@ app.post('/api/generate', async (req, res) => {
       body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
+    if (!d.content || !d.content[0]) {
+      return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
+    }
     const text = d.content[0].text.replace(/```json|```/g, '').trim();
     res.json(JSON.parse(text));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/synthesize', async (req, res) => {
@@ -53,7 +58,9 @@ app.post('/api/synthesize', async (req, res) => {
     const buf = await r.arrayBuffer();
     res.set('Content-Type', 'audio/mpeg');
     res.send(Buffer.from(buf));
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
