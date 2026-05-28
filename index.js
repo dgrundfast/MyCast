@@ -23,51 +23,34 @@ app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-
-  // FIX 1: Tighter prompt — short scripts so response never gets cut off
-  const prompt = `Create a 3-episode podcast series about "${topic}".
-
-Return ONLY raw JSON — no markdown, no code fences, no explanation. The JSON must be complete and valid.
-
-{"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast intro script."},{"episode_number":2,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast script."}]}`;
-
+  const prompt = `Create a 3-episode podcast series about "${topic}". Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":2,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."}]}`;
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      // FIX 2: Lower max_tokens (scripts are short now) + stop_sequences prevents code fence wrapping
-    body: JSON.stringify({
-  model: 'claude-sonnet-4-5',
-  max_tokens: 1500,
-  messages: [{ role: 'user', content: prompt }],
-}),
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
       return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
     }
-
-    // FIX 3: Strip fences, validate completeness before returning
     let text = d.content[0].text.trim();
     text = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
-
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start === -1 || end === -1) {
       return res.status(500).json({ error: 'No JSON found in response', raw: text.slice(0, 200) });
     }
     text = text.slice(start, end + 1);
-
     try {
       const parsed = JSON.parse(text);
       if (!parsed.episodes || parsed.episodes.length < 3) {
-        return res.status(500).json({ error: 'Incomplete response — missing episodes', raw: text.slice(0, 200) });
+        return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
       }
       res.json(parsed);
     } catch (parseErr) {
       res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
     }
-
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
