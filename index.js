@@ -36,12 +36,11 @@ Return ONLY raw JSON — no markdown, no code fences, no explanation. The JSON m
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
       // FIX 2: Lower max_tokens (scripts are short now) + stop_sequences prevents code fence wrapping
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-5',
-        max_tokens: 1500,
-        stop_sequences: ['```'],
-        messages: [{ role: 'user', content: prompt }],
-      }),
+    body: JSON.stringify({
+  model: 'claude-sonnet-4-5',
+  max_tokens: 1500,
+  messages: [{ role: 'user', content: prompt }],
+}),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
