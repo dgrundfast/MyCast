@@ -5,10 +5,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
-
 const AK = process.env.ANTHROPIC_API_KEY;
 const EK = process.env.ELEVENLABS_API_KEY;
-
 const VOICES = {
   alex:   { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh' },
   james:  { id: 'VR6AewLTigWG4xSOukaG', name: 'Arnold' },
@@ -17,39 +15,64 @@ const VOICES = {
   roger:  { id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger' },
   brian:  { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian' },
 };
-
 app.get('/api/health', (req, res) => res.json({ ok: true }));
-
 app.get('/api/voices', (req, res) => {
   res.json(Object.entries(VOICES).map(([key, v]) => ({ key, name: v.name, desc: v.name })));
 });
-
 app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-  const prompt = `Create a 3-episode podcast about "${topic}". Return ONLY this JSON structure with no other text: {"series_title":"short title","series_subtitle":"one sentence","episodes":[{"episode_number":1,"title":"title","duration_minutes":${mins},"teaser":"one sentence","script":"A short 100-word podcast script."},{"episode_number":2,"title":"title","duration_minutes":${mins},"teaser":"one sentence","script":"A short 100-word podcast script."},{"episode_number":3,"title":"title","duration_minutes":${mins},"teaser":"one sentence","script":"A short 100-word podcast script."}]}`;
+
+  // FIX 1: Tighter prompt — short scripts so response never gets cut off
+  const prompt = `Create a 3-episode podcast series about "${topic}".
+
+Return ONLY raw JSON — no markdown, no code fences, no explanation. The JSON must be complete and valid.
+
+{"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast intro script."},{"episode_number":2,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"Exactly 2-3 sentences of podcast script."}]}`;
+
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 4000, messages: [{ role: 'user', content: prompt }] }),
+      // FIX 2: Lower max_tokens (scripts are short now) + stop_sequences prevents code fence wrapping
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 1500,
+        stop_sequences: ['```'],
+        messages: [{ role: 'user', content: prompt }],
+      }),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
       return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
     }
-    let text = d.content[0].text;
-const start = text.indexOf('{');
-const end = text.lastIndexOf('}');
-if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found in response' });
-text = text.slice(start, end + 1);
-res.json(JSON.parse(text));
+
+    // FIX 3: Strip fences, validate completeness before returning
+    let text = d.content[0].text.trim();
+    text = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
+
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1) {
+      return res.status(500).json({ error: 'No JSON found in response', raw: text.slice(0, 200) });
+    }
+    text = text.slice(start, end + 1);
+
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed.episodes || parsed.episodes.length < 3) {
+        return res.status(500).json({ error: 'Incomplete response — missing episodes', raw: text.slice(0, 200) });
+      }
+      res.json(parsed);
+    } catch (parseErr) {
+      res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
+    }
+
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-
 app.post('/api/synthesize', async (req, res) => {
   const { text, voiceKey } = req.body;
   const voice = VOICES[voiceKey] || VOICES.alex;
@@ -66,8 +89,6 @@ app.post('/api/synthesize', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('MyCast on port ' + PORT));
