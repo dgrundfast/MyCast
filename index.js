@@ -28,12 +28,12 @@ app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 10 : parseInt(episodeLength);
-  const prompt = `You are MyCast. User wants to learn: "${topic}". Create a 5-episode podcast series with ${mins}-minute episodes. Return ONLY valid JSON, no markdown, no code fences. Keep each script under 500 words. Format: {"series_title":"title","series_subtitle":"subtitle","episodes":[{"episode_number":1,"title":"ep title","duration_minutes":${mins},"teaser":"one sentence","script":"concise engaging script under 500 words"}]}`;
+  const prompt = `You are MyCast. User wants to learn: "${topic}". Create a 5-episode podcast series. Return ONLY valid JSON, no markdown, no code fences. Each script must be under 200 words. Format: {"series_title":"title","series_subtitle":"subtitle","episodes":[{"episode_number":1,"title":"ep title","duration_minutes":${mins},"teaser":"one sentence","script":"script under 200 words"}]}`;
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 16000, messages: [{ role: 'user', content: prompt }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 8000, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
