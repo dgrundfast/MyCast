@@ -39,8 +39,12 @@ app.post('/api/generate', async (req, res) => {
     if (!d.content || !d.content[0]) {
       return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
     }
-    const text = d.content[0].text.replace(/```json|```/g, '').trim();
-    res.json(JSON.parse(text));
+    let text = d.content[0].text;
+const start = text.indexOf('{');
+const end = text.lastIndexOf('}');
+if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found in response' });
+text = text.slice(start, end + 1);
+res.json(JSON.parse(text));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
