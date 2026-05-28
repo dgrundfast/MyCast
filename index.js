@@ -23,7 +23,7 @@ app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-  const prompt = `Create a 3-episode podcast series about "${topic}". Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":2,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":${mins},"teaser":"one sentence hook","script":"2-3 sentences of podcast script."}]}`;
+  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."}]}';
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -35,11 +35,10 @@ app.post('/api/generate', async (req, res) => {
       return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
     }
     let text = d.content[0].text.trim();
-    text = text.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/i, '').trim();
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
     if (start === -1 || end === -1) {
-      return res.status(500).json({ error: 'No JSON found in response', raw: text.slice(0, 200) });
+      return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
     }
     text = text.slice(start, end + 1);
     try {
@@ -59,7 +58,7 @@ app.post('/api/synthesize', async (req, res) => {
   const { text, voiceKey } = req.body;
   const voice = VOICES[voiceKey] || VOICES.alex;
   try {
-    const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice.id}`, {
+    const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
       body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
@@ -73,4 +72,4 @@ app.post('/api/synthesize', async (req, res) => {
 });
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v2 on port ' + PORT));
+app.listen(PORT, () => console.log('MyCast v3 on port ' + PORT));
