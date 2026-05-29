@@ -83,5 +83,3 @@ app.post('/api/synthesize', async (req, res) => {
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('MyCast v5 on port ' + PORT));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v4 on port ' + PORT));
