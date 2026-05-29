@@ -63,7 +63,7 @@ app.post('/api/synthesize', async (req, res) => {
     const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
     });
     console.log('ElevenLabs status:', r.status);
     if (!r.ok) {
