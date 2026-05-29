@@ -23,12 +23,14 @@ app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
   const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"2-3 sentences of podcast script."}]}';
+  const wordsPerMinute = 150;
+  const targetWords = mins * wordsPerMinute;
+  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Each episode script should be approximately ' + targetWords + ' words long to fill ' + mins + ' minutes of audio. Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."}]}';
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
@@ -79,5 +81,7 @@ app.post('/api/synthesize', async (req, res) => {
   }
 });
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('MyCast v5 on port ' + PORT));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('MyCast v4 on port ' + PORT));
