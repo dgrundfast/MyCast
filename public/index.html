@@ -11,21 +11,19 @@
 html,body{height:100%;font-family:'DM Sans',sans-serif;background:#0e0d0b;color:#f5f0e8;-webkit-font-smoothing:antialiased}
 .screen{display:none;min-height:100vh;flex-direction:column}
 .screen.active{display:flex}
-/* Header */
 .hdr{display:flex;align-items:center;justify-content:space-between;padding:20px 40px;border-bottom:1px solid rgba(255,255,255,0.07);flex-shrink:0;position:relative;z-index:2}
-.logo{display:flex;align-items:center;gap:10px}
-.logo-icon{width:34px;height:34px;border-radius:8px;overflow:hidden;background:linear-gradient(135deg,#e8a838,#c87d10);display:flex;align-items:center;justify-content:center;font-size:17px;color:#fff}
-.logo-img{width:100%;height:100%;object-fit:cover;border-radius:8px}
-.logo-text{font-family:'Playfair Display',serif;font-size:20px;font-weight:600}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:44px;height:44px;border-radius:10px;overflow:hidden;background:linear-gradient(135deg,#e8a838,#c87d10);display:flex;align-items:center;justify-content:center;font-size:22px;color:#fff}
+.logo-img{width:100%;height:100%;object-fit:cover;border-radius:10px}
+.logo-text{font-family:'Playfair Display',serif;font-size:26px;font-weight:700;letter-spacing:-0.5px}
 .badge{padding:3px 9px;border-radius:99px;font-size:11px;font-weight:500;background:#252118;color:#a09880;border:1px solid rgba(255,255,255,0.12)}
 .badge-green{background:rgba(61,184,122,0.12);color:#3db87a;border-color:rgba(61,184,122,0.25)}
 .badge-purple{background:rgba(139,92,246,0.12);color:#8b5cf6;border-color:rgba(139,92,246,0.25)}
 .hdr-actions{display:flex;align-items:center;gap:10px}
 .btn-icon{width:36px;height:36px;border-radius:8px;background:#1e1b16;border:1px solid rgba(255,255,255,0.07);color:#a09880;cursor:pointer;font-size:16px;display:flex;align-items:center;justify-content:center}
 .btn-outline{display:flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.12);color:#f5f0e8;font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer}
-/* Setup */
 .setup-main{flex:1;display:flex;flex-direction:column;align-items:center;padding:48px 24px 64px;position:relative;z-index:1}
-.hero{text-align:center;margin-bottom:48px;max-width:520px}
+.hero{text-align:center;margin-bottom:48px;max-width:560px}
 .hero-title{font-family:'Playfair Display',serif;font-size:clamp(2.4rem,5vw,3.6rem);font-weight:700;line-height:1.15;margin-bottom:16px}
 .hero-title em{font-style:italic;color:#e8a838}
 .hero-sub{font-size:16px;color:#a09880;line-height:1.7;font-weight:300}
@@ -50,7 +48,6 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:#0e0d0b;color:
 .error-msg{background:rgba(224,82,82,0.1);border:1px solid rgba(224,82,82,0.25);border-radius:10px;padding:12px 16px;color:#f09090;font-size:13px}
 .btn-generate{position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;gap:10px;padding:15px 32px;border:none;border-radius:10px;background:linear-gradient(135deg,#e8a838,#c87d10);color:#fff;font-family:'DM Sans',sans-serif;font-size:15px;font-weight:500;cursor:pointer;box-shadow:0 4px 20px rgba(232,168,56,0.3)}
 .btn-generate:disabled{opacity:.4;cursor:not-allowed}
-/* Loading */
 .loading-content{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:40px;text-align:center}
 .loader-ring{position:relative;width:80px;height:80px;display:flex;align-items:center;justify-content:center}
 .lsvg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
@@ -66,7 +63,6 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:#0e0d0b;color:
 .step.active{color:#f5f0e8}
 .step.done{color:#3db87a}
 .step.done i{opacity:1}
-/* Player */
 #screen-player{flex-direction:column}
 .player-layout{flex:1;display:grid;grid-template-columns:300px 1fr;overflow:hidden}
 .sidebar{border-right:1px solid rgba(255,255,255,0.07);display:flex;flex-direction:column;overflow:hidden;background:#161410}
@@ -139,7 +135,7 @@ html,body{height:100%;font-family:'DM Sans',sans-serif;background:#0e0d0b;color:
   </header>
   <main class="setup-main">
     <div class="hero">
-      <h1 class="hero-title">Your knowledge,<br/><em>on demand.</em></h1>
+      <h1 class="hero-title">Any topic.<br/><em>Expert knowledge, on demand.</em></h1>
       <p class="hero-sub">Tell us what you want to master. We'll build your personal podcast series — crafted just for you, voiced by AI.</p>
     </div>
     <div class="setup-form">
