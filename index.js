@@ -30,7 +30,7 @@ app.post('/api/generate', async (req, res) => {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8192, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) {
@@ -63,7 +63,7 @@ app.post('/api/synthesize', async (req, res) => {
     const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 4096, messages: [{ role: 'user', content: prompt }] }),
+      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
     });
     console.log('ElevenLabs status:', r.status);
     if (!r.ok) {
@@ -82,4 +82,4 @@ app.post('/api/synthesize', async (req, res) => {
 });
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v5 on port ' + PORT));
+app.listen(PORT, () => console.log('MyCast v6 on port ' + PORT));
