@@ -17,8 +17,11 @@ const VOICES = {
   brian:  { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian' },
 };
 
-// In-memory cache (resets on redeploy — good enough for now, upgrade to Redis later)
+// In-memory cache for briefings
 const briefingCache = {};
+
+// In-memory schedule store (upgrade to database later)
+const scheduleStore = {};
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
@@ -41,6 +44,21 @@ app.get('/api/channels', (req, res) => {
   ]);
 });
 
+app.post('/api/schedule', (req, res) => {
+  const { enabled, time, channelIds } = req.body;
+  if (enabled === undefined || !time || !channelIds) return res.status(400).json({ error: 'Missing required fields' });
+  const sortedChannelIds = channelIds.slice().sort();
+  const scheduleKey = sortedChannelIds.join('+');
+  if (enabled) {
+    scheduleStore[scheduleKey] = { enabled: true, time, channelIds: sortedChannelIds, updatedAt: new Date().toISOString() };
+    console.log('Schedule saved:', scheduleKey, 'at', time);
+  } else {
+    delete scheduleStore[scheduleKey];
+    console.log('Schedule removed:', scheduleKey);
+  }
+  res.status(200).json({});
+});
+
 app.post('/api/briefing', async (req, res) => {
   const { channels, channelIds, topics, episodeLength, maxWords, date, timestamp, timezone } = req.body;
   const mins = episodeLength || 5;
@@ -52,7 +70,6 @@ app.post('/api/briefing', async (req, res) => {
   const sortedChannelIds = (channelIds || []).slice().sort();
   const cacheKey = sortedChannelIds.join('+') + '_' + briefingDate + '_' + mins + '_' + topicsHash;
 
-  // Return cached response if available
   if (briefingCache[cacheKey]) {
     console.log('Cache hit:', cacheKey);
     return res.json(briefingCache[cacheKey]);
@@ -71,7 +88,7 @@ app.post('/api/briefing', async (req, res) => {
     'Start with "Good morning." and cover the most important developments across each area. ' +
     'Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: ' +
     '{"title":"Morning Briefing — ' + dateLabel + '","subtitle":"' + dateLabel + '","teaser":"One sentence summary of top stories.","script":"The full spoken script here — ' + wordLimit + ' words or less.","sources":["Reuters","Associated Press","BBC News"]}' +
-    ' For sources, list the real news outlets that cover these topics (e.g. Reuters, Associated Press, BBC News, Bloomberg, ESPN). List one per topic or channel covered. Be specific to the channels requested.';
+    ' For sources, list the real news outlets that cover these topics (e.g. Reuters, Associated Press, BBC News, Bloomberg, ESPN). List one per topic or channel covered.';
 
   try {
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -81,80 +98,3 @@ app.post('/api/briefing', async (req, res) => {
     });
     const d = await r.json();
     if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
-    let text = d.content[0].text.trim();
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
-    text = text.slice(start, end + 1);
-    const parsed = JSON.parse(text);
-
-    // Cache the result
-    briefingCache[cacheKey] = parsed;
-    console.log('Cache set:', cacheKey);
-
-    res.json(parsed);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/generate', async (req, res) => {
-  const { topic, episodeLength } = req.body;
-  if (!topic) return res.status(400).json({ error: 'Topic required' });
-  const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-  const wordsPerMinute = 150;
-  const targetWords = mins * wordsPerMinute;
-  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Each episode script should be approximately ' + targetWords + ' words long to fill ' + mins + ' minutes of audio. Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."}]}';
-  try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8192, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const d = await r.json();
-    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
-    let text = d.content[0].text.trim();
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
-    text = text.slice(start, end + 1);
-    try {
-      const parsed = JSON.parse(text);
-      if (!parsed.episodes || parsed.episodes.length < 3) return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
-      res.json(parsed);
-    } catch (parseErr) {
-      res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
-    }
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/synthesize', async (req, res) => {
-  const { text, voiceKey } = req.body;
-  const voice = VOICES[voiceKey] || VOICES.alex;
-  try {
-    const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
-    });
-    console.log('ElevenLabs status:', r.status);
-    if (!r.ok) {
-      const errText = await r.text();
-      console.log('ElevenLabs error:', errText);
-      return res.status(500).json({ error: 'ElevenLabs error: ' + errText });
-    }
-    const buf = await r.arrayBuffer();
-    console.log('Audio buffer size:', buf.byteLength);
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(Buffer.from(buf));
-  } catch (e) {
-    console.log('Synthesize exception:', e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v8 on port ' + PORT));
