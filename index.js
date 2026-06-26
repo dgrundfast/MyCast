@@ -1,0 +1,173 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const crypto = require('crypto');
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+const AK = process.env.ANTHROPIC_API_KEY;
+const EK = process.env.ELEVENLABS_API_KEY;
+const VOICES = {
+  alex:   { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh' },
+  james:  { id: 'VR6AewLTigWG4xSOukaG', name: 'Arnold' },
+  maya:   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella' },
+  sophie: { id: 'MF3mGyEYCl7XYWbV9V6O', name: 'Elli' },
+  roger:  { id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger' },
+  brian:  { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian' },
+};
+
+const briefingCache = {};
+const scheduleStore = {};
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.get('/api/voices', (req, res) => {
+  res.json(Object.entries(VOICES).map(([key, v]) => ({ key, name: v.name, desc: v.name })));
+});
+
+app.get('/api/channels', (req, res) => {
+  res.json([
+    { id: 'world',         name: 'World News',           symbol: 'globe',                      color: '#4F9CF0' },
+    { id: 'politics',      name: 'US Politics',           symbol: 'building.columns.fill',      color: '#D06B6B' },
+    { id: 'technology',    name: 'Technology',            symbol: 'cpu',                        color: '#7C8CF8' },
+    { id: 'markets',       name: 'Markets & Finance',     symbol: 'chart.line.uptrend.xyaxis',  color: '#4FCB8B' },
+    { id: 'science',       name: 'Science',               symbol: 'atom',                       color: '#F0A04F' },
+    { id: 'health',        name: 'Health',                symbol: 'heart.fill',                 color: '#F06F8C' },
+    { id: 'sports',        name: 'Sports',                symbol: 'sportscourt.fill',           color: '#4FC8F0' },
+    { id: 'entertainment', name: 'Entertainment',         symbol: 'star.fill',                  color: '#C87CF8' },
+    { id: 'climate',       name: 'Climate & Environment', symbol: 'leaf.fill',                  color: '#4FCB8B' },
+    { id: 'business',      name: 'Business',              symbol: 'briefcase.fill',             color: '#F0C44F' },
+  ]);
+});
+
+app.post('/api/schedule', (req, res) => {
+  const { enabled, time, channelIds } = req.body;
+  if (enabled === undefined || !time || !channelIds) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  const sortedChannelIds = channelIds.slice().sort();
+  const scheduleKey = sortedChannelIds.join('+');
+  if (enabled) {
+    scheduleStore[scheduleKey] = { enabled: true, time, channelIds: sortedChannelIds, updatedAt: new Date().toISOString() };
+    console.log('Schedule saved:', scheduleKey, 'at', time);
+  } else {
+    delete scheduleStore[scheduleKey];
+    console.log('Schedule removed:', scheduleKey);
+  }
+  res.status(200).json({});
+});
+
+app.post('/api/briefing', async (req, res) => {
+  const { channels, channelIds, topics, episodeLength, maxWords, date, timestamp, timezone } = req.body;
+  const mins = episodeLength || 5;
+  const wordLimit = maxWords || 400;
+  const briefingDate = date || new Date().toISOString().split('T')[0];
+  const briefingTimestamp = timestamp || new Date().toISOString();
+  const sortedTopics = (topics || []).slice().sort();
+  const topicsHash = crypto.createHash('sha1').update(sortedTopics.join('|')).digest('hex').slice(0, 8);
+  const sortedChannelIds = (channelIds || []).slice().sort();
+  const cacheKey = sortedChannelIds.join('+') + '_' + briefingDate + '_' + mins + '_' + topicsHash;
+
+  if (briefingCache[cacheKey]) {
+    console.log('Cache hit:', cacheKey);
+    return res.json(briefingCache[cacheKey]);
+  }
+
+  const channelList = (channels || []).join(', ');
+  const topicList = sortedTopics.length ? sortedTopics.join(', ') : null;
+  const dateLabel = new Date(briefingTimestamp).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+
+  const prompt = 'You are a professional news anchor delivering a morning briefing podcast. ' +
+    'Today is ' + dateLabel + ' (' + briefingTimestamp + '). ' +
+    'Write a morning briefing script covering these topic channels: ' + channelList + '.' +
+    (topicList ? ' Also specifically cover these focus areas: ' + topicList + '.' : '') +
+    ' The script must be ' + wordLimit + ' words or less. ' +
+    'Write in a natural, conversational podcast style — punchy, clear, and engaging. ' +
+    'Start with "Good morning." and cover the most important developments across each area. ' +
+    'Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: ' +
+    '{"title":"Morning Briefing — ' + dateLabel + '","subtitle":"' + dateLabel + '","teaser":"One sentence summary of top stories.","script":"The full spoken script here.","sources":["Reuters","Associated Press","BBC News"]}' +
+    ' For sources, list the real news outlets that cover these topics (e.g. Reuters, Associated Press, BBC News, Bloomberg, ESPN). List one per topic or channel covered.';
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const d = await r.json();
+    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
+    let text = d.content[0].text.trim();
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
+    text = text.slice(start, end + 1);
+    const parsed = JSON.parse(text);
+    briefingCache[cacheKey] = parsed;
+    console.log('Cache set:', cacheKey);
+    res.json(parsed);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/generate', async (req, res) => {
+  const { topic, episodeLength } = req.body;
+  if (!topic) return res.status(400).json({ error: 'Topic required' });
+  const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
+  const wordsPerMinute = 150;
+  const targetWords = mins * wordsPerMinute;
+  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Each episode script should be approximately ' + targetWords + ' words long to fill ' + mins + ' minutes of audio. Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."}]}';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8192, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const d = await r.json();
+    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
+    let text = d.content[0].text.trim();
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
+    text = text.slice(start, end + 1);
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed.episodes || parsed.episodes.length < 3) return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
+      res.json(parsed);
+    } catch (parseErr) {
+      res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/synthesize', async (req, res) => {
+  const { text, voiceKey } = req.body;
+  const voice = VOICES[voiceKey] || VOICES.alex;
+  try {
+    const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
+      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
+    });
+    console.log('ElevenLabs status:', r.status);
+    if (!r.ok) {
+      const errText = await r.text();
+      console.log('ElevenLabs error:', errText);
+      return res.status(500).json({ error: 'ElevenLabs error: ' + errText });
+    }
+    const buf = await r.arrayBuffer();
+    console.log('Audio buffer size:', buf.byteLength);
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(Buffer.from(buf));
+  } catch (e) {
+    console.log('Synthesize exception:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('MyCast v8 on port ' + PORT));
