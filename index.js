@@ -15,10 +15,63 @@ const VOICES = {
   roger:  { id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger' },
   brian:  { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian' },
 };
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
 app.get('/api/voices', (req, res) => {
   res.json(Object.entries(VOICES).map(([key, v]) => ({ key, name: v.name, desc: v.name })));
 });
+
+app.get('/api/channels', (req, res) => {
+  res.json([
+    { id: 'world',       name: 'World News',          symbol: 'globe',                       color: '#4F9CF0' },
+    { id: 'politics',    name: 'US Politics',          symbol: 'building.columns.fill',       color: '#D06B6B' },
+    { id: 'technology',  name: 'Technology',           symbol: 'cpu',                         color: '#7C8CF8' },
+    { id: 'markets',     name: 'Markets & Finance',    symbol: 'chart.line.uptrend.xyaxis',   color: '#4FCB8B' },
+    { id: 'science',     name: 'Science',              symbol: 'atom',                        color: '#F0A04F' },
+    { id: 'health',      name: 'Health',               symbol: 'heart.fill',                  color: '#F06F8C' },
+    { id: 'sports',      name: 'Sports',               symbol: 'sportscourt.fill',            color: '#4FC8F0' },
+    { id: 'entertainment', name: 'Entertainment',      symbol: 'star.fill',                   color: '#C87CF8' },
+    { id: 'climate',     name: 'Climate & Environment', symbol: 'leaf.fill',                  color: '#4FCB8B' },
+    { id: 'business',    name: 'Business',             symbol: 'briefcase.fill',              color: '#F0C44F' },
+  ]);
+});
+
+app.post('/api/briefing', async (req, res) => {
+  const { channels, channelIds, topics, episodeLength, maxWords } = req.body;
+  const mins = episodeLength || 5;
+  const wordLimit = maxWords || 400;
+  const today = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  const channelList = (channels || []).join(', ');
+  const topicList = (topics && topics.length) ? topics.join(', ') : null;
+  const prompt = 'You are a professional news anchor delivering a morning briefing podcast. Today is ' + today + '. ' +
+    'Write a morning briefing script covering these topics: ' + channelList + '.' +
+    (topicList ? ' Also cover these specific focus areas: ' + topicList + '.' : '') +
+    ' The script must be ' + wordLimit + ' words or less. Write in a natural, conversational podcast style — punchy, clear, and engaging. ' +
+    'Start with "Good morning." and cover the most important developments in each area. ' +
+    'Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: ' +
+    '{"title":"Your Morning Briefing","subtitle":"' + today + '","teaser":"One sentence summary of top stories.","script":"The full spoken script here.","sources":["Source 1","Source 2","Source 3"]}' +
+    ' For sources, list the real news outlets you would draw from for these topics (e.g. Reuters, Associated Press, BBC News, Bloomberg). List one per topic covered.';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
+    });
+    const d = await r.json();
+    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
+    let text = d.content[0].text.trim();
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
+    text = text.slice(start, end + 1);
+    const parsed = JSON.parse(text);
+    res.json(parsed);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/generate', async (req, res) => {
   const { topic, episodeLength } = req.body;
   if (!topic) return res.status(400).json({ error: 'Topic required' });
@@ -33,21 +86,15 @@ app.post('/api/generate', async (req, res) => {
       body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8192, messages: [{ role: 'user', content: prompt }] }),
     });
     const d = await r.json();
-    if (!d.content || !d.content[0]) {
-      return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
-    }
+    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
     let text = d.content[0].text.trim();
     const start = text.indexOf('{');
     const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1) {
-      return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
-    }
+    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
     text = text.slice(start, end + 1);
     try {
       const parsed = JSON.parse(text);
-      if (!parsed.episodes || parsed.episodes.length < 3) {
-        return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
-      }
+      if (!parsed.episodes || parsed.episodes.length < 3) return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
       res.json(parsed);
     } catch (parseErr) {
       res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
@@ -56,6 +103,7 @@ app.post('/api/generate', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 app.post('/api/synthesize', async (req, res) => {
   const { text, voiceKey } = req.body;
   const voice = VOICES[voiceKey] || VOICES.alex;
@@ -80,6 +128,7 @@ app.post('/api/synthesize', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v6 on port ' + PORT));
+app.listen(PORT, () => console.log('MyCast v7 on port ' + PORT));
