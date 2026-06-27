@@ -143,6 +143,19 @@ const store = {
     }
     return null;
   },
+  // Evergreen reuse: find a fully-successful series with this signature (any
+  // owner) to clone, so identical deep dives never re-bill the LLM or TTS.
+  async findSharedSeries(sig) {
+    for (const s of _series.values()) {
+      if (s.sig === sig && s.reusable === true) return s;
+    }
+    if (USE_DB) {
+      const r = await pool.query(
+        "SELECT data FROM series WHERE data->>'sig'=$1 AND data->>'reusable'='true' ORDER BY created_at ASC LIMIT 1", [sig]);
+      if (r.rows[0]) return r.rows[0].data;
+    }
+    return null;
+  },
   async saveSchedule(sc) {
     _schedules.set(sc.id, sc);
     if (USE_DB) await pool.query(
@@ -777,6 +790,19 @@ function absolute(url) { return PUBLIC_BASE_URL ? PUBLIC_BASE_URL + url : url; }
 /* Generate ALL segments for one episode, in order, marking each ready as it
    finishes so the player can start on segment 1 immediately. Persists after
    each segment so the manifest reflects progress even after a restart.      */
+/* Classify a TTS failure so the app can show a useful message and we can
+   stop hammering a provider that's globally failing (bad key / no credits). */
+function classifyTtsError(msg) {
+  const m = String(msg || '').toLowerCase();
+  if (m.includes('quota') || m.includes('credit') || m.includes('exceeded') || m.includes('insufficient'))
+    return { code: 'tts_quota', label: 'Audio service is out of credits', fatal: true };
+  if (m.includes('401') || m.includes('403') || m.includes('unauthor') || m.includes('invalid') || m.includes('api key') || m.includes('api_key'))
+    return { code: 'tts_auth', label: 'Audio service rejected the API key', fatal: true };
+  if (m.includes('429') || m.includes('rate'))
+    return { code: 'tts_rate', label: 'Audio service is rate-limited', fatal: false };
+  return { code: 'tts_error', label: 'Audio service error', fatal: false };
+}
+
 async function generateEpisodeSegments(ep, scriptText) {
   const parts = splitIntoSegments(scriptText, 200);
   ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
@@ -790,11 +816,26 @@ async function generateEpisodeSegments(ep, scriptText) {
     } catch (e) {
       ep.segments[i].status = 'failed';
       ep.segments[i].error = e.message;
-      console.log('segment synth failed:', e.message);
+      const cls = classifyTtsError(e.message);
+      ep.error = cls.label;          // top-level reason the app can show
+      ep.errorCode = cls.code;       // machine-readable: tts_quota | tts_auth | tts_rate | tts_error
+      console.log('segment synth failed [' + cls.code + ']:', e.message);
+      if (cls.fatal) {
+        // bad key / no credits won't fix itself across segments — stop now
+        for (let j = i + 1; j < parts.length; j++) {
+          ep.segments[j].status = 'failed';
+          ep.segments[j].error = 'aborted: ' + cls.code;
+        }
+        await store.updateEpisode(ep);
+        break;
+      }
     }
     await store.updateEpisode(ep); // persist progress segment-by-segment
   }
-  ep.status = ep.segments.every(s => s.status === 'ready') ? 'complete' : 'partial';
+  const anyReady = ep.segments.some(s => s.status === 'ready');
+  const allReady = ep.segments.every(s => s.status === 'ready');
+  ep.status = allReady ? 'complete' : (anyReady ? 'partial' : 'failed');
+  if (allReady) { ep.error = undefined; ep.errorCode = undefined; }
   await store.updateEpisode(ep);
 }
 
@@ -896,7 +937,23 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.10', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.12', mock: MOCK_MODE, db: USE_DB }));
+
+// One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
+// key/credits without generating a whole episode. Returns the exact failure
+// reason if it fails. Gated behind ADMIN_TOKEN when one is configured.
+app.get('/api/diag/tts', async (req, res) => {
+  if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN)
+    return res.status(401).json({ error: 'admin token required' });
+  if (MOCK_MODE) return res.json({ ok: true, mock: true, note: 'MOCK_MODE active — no real keys set, so synthesis is placeholder.' });
+  try {
+    const { bytes } = await synthesizeToFile('This is a test.', 'josh');
+    res.json({ ok: true, bytes, note: 'ElevenLabs synthesized successfully — key and credits are good.' });
+  } catch (e) {
+    const cls = classifyTtsError(e.message);
+    res.json({ ok: false, code: cls.code, reason: cls.label, detail: String(e.message).slice(0, 300) });
+  }
+});
 
 app.get('/api/voices', (req, res) => {
   res.json({
@@ -971,6 +1028,37 @@ app.post('/api/brief', async (req, res) => {
 });
 
 /* ----- DEEP DIVE -------------------------------------------------------- */
+/* Evergreen deep-dive reuse -------------------------------------------------
+   Deep dives are general knowledge and expensive to synthesize. We tag each
+   finished series with a normalized signature and clone a matching one for the
+   next user instead of regenerating — reusing the already-synthesized (and
+   content-addressed) audio files. Zero LLM, zero TTS, instant, frontend-blind. */
+function normTopic(s) {
+  return String(s || '').toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
+}
+function deepdiveSig(topic, depth, lengthMin, voiceId) {
+  return normTopic(topic) + '|' + depth + '|' + lengthMin + '|' + voiceId;
+}
+async function cloneSeriesForUser(src, user) {
+  const newSerId = id('ser');
+  const episodes = [];
+  for (const ref of src.episodes) {
+    const srcEp = await store.getEpisode(ref.id);
+    if (!srcEp) continue;
+    const copy = JSON.parse(JSON.stringify(srcEp));
+    copy.id = id('ep'); copy.userId = user.id; copy.seriesId = newSerId; copy.createdAt = now();
+    await store.saveEpisode(copy);
+    episodes.push({ id: copy.id, index: copy.index, title: copy.title, status: copy.status });
+  }
+  const newSeries = JSON.parse(JSON.stringify(src));
+  newSeries.id = newSerId; newSeries.userId = user.id; newSeries.episodes = episodes;
+  newSeries.createdAt = now(); newSeries.clonedFrom = src.id;
+  delete newSeries.sig; delete newSeries.reusable; // the clone is not itself a template
+  await store.saveSeries(newSeries);
+  await store.addToLibrary({ type: 'deepdive', id: newSerId, title: newSeries.topic, createdAt: newSeries.createdAt, userId: user.id });
+  return newSeries;
+}
+
 app.post('/api/deepdive', async (req, res) => {
   const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'josh' } = req.body || {};
   const t = String(topic || '').trim();
@@ -985,10 +1073,19 @@ app.post('/api/deepdive', async (req, res) => {
   if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
 
+  // Evergreen reuse: if an identical series already exists, clone it (no LLM/TTS).
+  const sig = deepdiveSig(t, depth, episodeLengthMin, voiceId);
+  const shared = await store.findSharedSeries(sig);
+  if (shared) {
+    const cloned = await cloneSeriesForUser(shared, user);
+    console.log('deepdive cache HIT [' + sig + '] -> cloned ' + cloned.id);
+    return res.json({ seriesId: cloned.id, firstEpisodeId: cloned.episodes[0].id, plannedEpisodes: cloned.episodes, cached: true });
+  }
+
   const serId = id('ser');
   const series = {
     id: serId, userId: user.id, topic: t, depth, episodeLengthMin, voiceId,
-    label: DEPTH[depth].label, episodes: [], createdAt: now(), status: 'planning',
+    label: DEPTH[depth].label, episodes: [], createdAt: now(), status: 'planning', sig,
   };
   await store.saveSeries(series);
 
@@ -1036,6 +1133,11 @@ app.post('/api/deepdive', async (req, res) => {
       await store.updateSeries(series);
     }
     series.status = 'complete';
+    // Only a fully-successful series becomes a reusable template (never cache a
+    // series whose audio failed — e.g. a TTS-quota outage).
+    const allEps = await Promise.all(series.episodes.map(r => store.getEpisode(r.id)));
+    series.reusable = allEps.every(e => e && e.status === 'complete'
+      && e.segments.length > 0 && e.segments.every(s => s.status === 'ready'));
     await store.updateSeries(series);
     await store.addToLibrary({ type: 'deepdive', id: serId, title: t, createdAt: series.createdAt, userId: user.id });
   })();
@@ -1115,7 +1217,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.10 on port ' + PORT
+        console.log('MyCast v9.12 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -1127,7 +1229,7 @@ if (require.main === module) {
 // Exported for testing only.
 module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTopic, retrieveSources,
   tickSchedules, localParts, dueTimes, buildBriefEpisode, store,
-  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount };
+  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount, classifyTtsError };
 
 /* =========================================================================
    PRODUCTION NOTES (not code — read before selling)
