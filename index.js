@@ -266,6 +266,30 @@ const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N 
 const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'free'; // 'free' = open to all
 
 function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
+
+/* Billing: RevenueCat webhook config. Set REVENUECAT_WEBHOOK_TOKEN in Railway
+   to the same Authorization value you put in RevenueCat's webhook settings.
+   Edit REVENUECAT_TIER_MAP to match the entitlement/product IDs you configure
+   in RevenueCat; the heuristic fallback catches anything containing pro/plus. */
+const REVENUECAT_WEBHOOK_TOKEN = process.env.REVENUECAT_WEBHOOK_TOKEN || '';
+const REVENUECAT_TIER_MAP = {
+  // 'mycast_pro': 'pro', 'mycast_plus_monthly': 'plus',  // <- your real RC identifiers
+};
+function tierFromRevenueCat(ev) {
+  const ids = [].concat(ev.entitlement_ids || [], ev.product_id ? [ev.product_id] : []).map(x => String(x).toLowerCase());
+  for (const id of ids) if (REVENUECAT_TIER_MAP[id]) return REVENUECAT_TIER_MAP[id];
+  if (ids.some(id => id.includes('pro'))) return 'pro';
+  if (ids.some(id => id.includes('plus'))) return 'plus';
+  return 'plus'; // an unclassifiable active purchase still grants the entry paid tier
+}
+async function setUserTier(userId, tier) {
+  const user = await store.getUser(userId);
+  if (!user) return false;
+  user.tier = tier;
+  await store.updateUser(user);
+  return true;
+}
+
 function periodKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
 function ensurePeriod(user) {
   const k = periodKey();
@@ -1080,7 +1104,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.14', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.15', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1145,11 +1169,50 @@ app.post('/api/admin/set-tier', async (req, res) => {
     return res.status(403).json({ error: 'forbidden' });
   const { userId, tier } = req.body || {};
   if (!['free', 'plus', 'pro'].includes(tier)) return res.status(400).json({ error: 'bad tier' });
-  const user = await store.getUser(userId);
-  if (!user) return res.status(404).json({ error: 'no such user' });
-  user.tier = tier;
-  await store.updateUser(user);
+  const ok = await setUserTier(userId, tier);
+  if (!ok) return res.status(404).json({ error: 'no such user' });
   res.json({ userId, tier });
+});
+
+/* RevenueCat webhook — billing source of truth. The app must set RevenueCat's
+   appUserID to the MyCast user.id (the one from /api/auth/register) so events
+   map to the right account. Configure the webhook URL + Authorization header in
+   RevenueCat, and set REVENUECAT_WEBHOOK_TOKEN to that same value. Always 200s
+   (even on no-op/user-not-found) so RevenueCat doesn't retry forever. */
+app.post('/api/revenuecat/webhook', async (req, res) => {
+  if (REVENUECAT_WEBHOOK_TOKEN) {
+    const auth = req.headers['authorization'] || '';
+    if (auth !== REVENUECAT_WEBHOOK_TOKEN && auth !== 'Bearer ' + REVENUECAT_WEBHOOK_TOKEN)
+      return res.status(401).json({ error: 'unauthorized' });
+  }
+  const ev = (req.body && req.body.event) || {};
+  const type = ev.type || '';
+  const userId = ev.app_user_id || ev.original_app_user_id;
+  if (!userId) return res.json({ ok: true, ignored: 'no app_user_id' });
+
+  let tier = null;
+  switch (type) {
+    case 'INITIAL_PURCHASE':
+    case 'RENEWAL':
+    case 'UNCANCELLATION':
+    case 'PRODUCT_CHANGE':
+    case 'NON_RENEWING_PURCHASE':
+      tier = tierFromRevenueCat(ev); break;
+    case 'EXPIRATION':
+      tier = 'free'; break;                 // access actually ended -> downgrade
+    case 'CANCELLATION':                     // auto-renew off, still has access until expiry
+    case 'BILLING_ISSUE':                    // grace period — don't yank access yet
+    default:
+      tier = null; break;                    // no tier change
+  }
+
+  if (!tier) {
+    console.log('revenuecat ' + type + ' -> no tier change (' + userId + ')');
+    return res.json({ ok: true, type, tier: 'unchanged' });
+  }
+  const applied = await setUserTier(userId, tier);
+  console.log('revenuecat ' + type + ' -> ' + userId + ' tier=' + tier + (applied ? '' : ' (user not found)'));
+  res.json({ ok: true, type, userId, tier, applied });
 });
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
@@ -1360,7 +1423,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.14 on port ' + PORT
+        console.log('MyCast v9.15 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
