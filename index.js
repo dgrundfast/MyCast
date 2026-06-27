@@ -1,4 +1,3 @@
-
 /* =========================================================================
    MyCast Backend — v9
    Two modes: GET BRIEFED (stay informed) + DEEP DIVE (build knowledge)
