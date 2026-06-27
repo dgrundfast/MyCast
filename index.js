@@ -1,173 +1,953 @@
+/* =========================================================================
+   MyCast Backend — v9
+   Two modes: GET BRIEFED (stay informed) + DEEP DIVE (build knowledge)
+   - Fast start: episodes are generated as SEGMENTS, synthesized one at a
+     time, and served by URL. The player polls a manifest and plays each
+     segment the moment it's ready — so audio starts in seconds while the
+     rest loads behind the scenes.
+   - Real sources: Briefs retrieve real, recent articles (keyless Google
+     News RSS) and filter them to the chosen time window, then write the
+     script grounded in them. Sources are stored and returned.
+   - MOCK_MODE: if API keys are missing, the whole pipeline runs with
+     placeholders so the architecture can be tested without keys.
+
+   Env vars (set in Railway → Variables):
+     ANTHROPIC_API_KEY   (required for real scripts)
+     ELEVENLABS_API_KEY  (required for real audio)
+     PORT                (Railway injects this)
+     PUBLIC_BASE_URL     (optional; e.g. https://mycast-v0fx-production.up.railway.app)
+   ========================================================================= */
+
 const express = require('express');
-const cors = require('cors');
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const Parser = require('rss-parser');
+
 const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-const AK = process.env.ANTHROPIC_API_KEY;
-const EK = process.env.ELEVENLABS_API_KEY;
+app.use(express.json({ limit: '2mb' }));
+
+const AK = process.env.ANTHROPIC_API_KEY || '';
+const EK = process.env.ELEVENLABS_API_KEY || '';
+const MOCK_MODE = !AK || !EK; // no keys -> safe placeholder mode for testing
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ''; // optional absolute URLs
+
+const rss = new Parser({ timeout: 8000 });
+
+/* ---------- audio storage (disk; served by URL) -------------------------
+   Railway's filesystem is ephemeral (wiped on redeploy/restart). That's
+   fine for "listen now" — for durable Library across deploys, swap this
+   for S3 / Cloudflare R2 later (see PRODUCTION NOTES at bottom).          */
+// Set AUDIO_DIR to a Railway Volume mount (e.g. /data/audio) so segment audio
+// survives redeploys. Falls back to local disk (ephemeral) if unset.
+const AUDIO_DIR = process.env.AUDIO_DIR || path.join(__dirname, 'audio_cache');
+fs.mkdirSync(AUDIO_DIR, { recursive: true });
+app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
+
+/* ---------- voices ------------------------------------------------------ */
 const VOICES = {
-  alex:   { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh' },
-  james:  { id: 'VR6AewLTigWG4xSOukaG', name: 'Arnold' },
-  maya:   { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella' },
-  sophie: { id: 'MF3mGyEYCl7XYWbV9V6O', name: 'Elli' },
-  roger:  { id: 'CwhRBWXzGAHq8TQ4Fs17', name: 'Roger' },
-  brian:  { id: 'nPczCjzI2devNBz1zQrb', name: 'Brian' },
+  // FREE — keep these two genuinely good; they're the hook.
+  josh:  { id: 'TxGEqnHWrfWFTfGW9XjX', displayName: 'Josh',  gender: 'male',   tier: 'free' },
+  bella: { id: 'EXAVITQu4vr4xnSDxMaL', displayName: 'Bella', gender: 'female', tier: 'free' },
+  // PAID — expand as you license more.
+  adam:  { id: 'pNInz6obpgDQGcFmaJgB', displayName: 'Adam',  gender: 'male',   tier: 'plus' },
+  rachel:{ id: '21m00Tcm4TlvDq8ikWAM', displayName: 'Rachel',gender: 'female', tier: 'plus' },
+  arnold:{ id: 'VR6AewLTigWG4xSOukaG', displayName: 'Arnold',gender: 'male',   tier: 'pro'  },
+};
+function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.josh; }
+
+/* =========================================================================
+   STORAGE — durable when DATABASE_URL is set, in-memory otherwise.
+   Strategy: a hot in-memory cache (so in-progress generation mutates a live
+   object) PLUS Postgres persistence (so data survives redeploys/restarts and
+   the Library rehydrates after a restart). If there's no DATABASE_URL, it
+   behaves exactly like the old in-memory MVP — nothing breaks before you add
+   Postgres; it auto-activates the moment DATABASE_URL exists.
+   ========================================================================= */
+const { Pool } = require('pg');
+const DATABASE_URL = process.env.DATABASE_URL || '';
+const USE_DB = !!DATABASE_URL;
+const pool = USE_DB
+  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+const id = (p) => p + '_' + crypto.randomBytes(6).toString('hex');
+const now = () => new Date().toISOString();
+
+// hot cache (also the entire store when USE_DB is false)
+const _episodes = new Map();
+const _series = new Map();
+const _schedules = new Map();
+const _library = []; // newest-first { type, id, title, createdAt } (in-memory mode)
+
+async function initDb() {
+  if (!USE_DB) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id text PRIMARY KEY, token text UNIQUE, tier text DEFAULT 'free',
+      gen_count int DEFAULT 0, period_start text, created_at timestamptz DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS episodes (
+      id text PRIMARY KEY, mode text, user_id text, data jsonb NOT NULL,
+      created_at timestamptz DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS series (
+      id text PRIMARY KEY, user_id text, data jsonb NOT NULL,
+      created_at timestamptz DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS schedules (
+      id text PRIMARY KEY, user_id text, data jsonb NOT NULL,
+      created_at timestamptz DEFAULT now()
+    );
+  `);
+  // safe column adds for pre-existing tables
+  for (const t of ['episodes', 'series', 'schedules']) {
+    try { await pool.query('ALTER TABLE ' + t + ' ADD COLUMN IF NOT EXISTS user_id text'); } catch (e) {}
+  }
+  console.log('Postgres ready.');
+}
+
+const _users = new Map();        // userId -> user
+const _tokenIndex = new Map();    // token -> userId
+
+const store = {
+  async saveEpisode(ep) {
+    _episodes.set(ep.id, ep);
+    if (USE_DB) await pool.query(
+      `INSERT INTO episodes (id, mode, user_id, data) VALUES ($1,$2,$3,$4)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, mode = EXCLUDED.mode, user_id = EXCLUDED.user_id`,
+      [ep.id, ep.mode, ep.userId || null, ep]);
+  },
+  async updateEpisode(ep) { return store.saveEpisode(ep); },
+  async getEpisode(epId) {
+    if (_episodes.has(epId)) return _episodes.get(epId);
+    if (USE_DB) {
+      const r = await pool.query('SELECT data FROM episodes WHERE id=$1', [epId]);
+      if (r.rows[0]) { _episodes.set(epId, r.rows[0].data); return r.rows[0].data; }
+    }
+    return null;
+  },
+  async saveSeries(s) {
+    _series.set(s.id, s);
+    if (USE_DB) await pool.query(
+      `INSERT INTO series (id, user_id, data) VALUES ($1,$2,$3)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, user_id = EXCLUDED.user_id`,
+      [s.id, s.userId || null, s]);
+  },
+  async updateSeries(s) { return store.saveSeries(s); },
+  async getSeries(sId) {
+    if (_series.has(sId)) return _series.get(sId);
+    if (USE_DB) {
+      const r = await pool.query('SELECT data FROM series WHERE id=$1', [sId]);
+      if (r.rows[0]) { _series.set(sId, r.rows[0].data); return r.rows[0].data; }
+    }
+    return null;
+  },
+  async saveSchedule(sc) {
+    _schedules.set(sc.id, sc);
+    if (USE_DB) await pool.query(
+      `INSERT INTO schedules (id, user_id, data) VALUES ($1,$2,$3)
+       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, user_id = EXCLUDED.user_id`,
+      [sc.id, sc.userId || null, sc]);
+  },
+  async listSchedules(userId) {
+    if (USE_DB) {
+      const r = await pool.query('SELECT data FROM schedules WHERE user_id=$1 ORDER BY created_at DESC', [userId]);
+      return r.rows.map(x => x.data);
+    }
+    return [..._schedules.values()].filter(s => s.userId === userId);
+  },
+  async listAllSchedules() {
+    if (USE_DB) {
+      const r = await pool.query('SELECT data FROM schedules');
+      return r.rows.map(x => x.data);
+    }
+    return [..._schedules.values()];
+  },
+  async addToLibrary(item) {
+    if (!USE_DB) _library.unshift(item); // DB mode derives library from tables
+  },
+  async getLibrary(userId) {
+    if (USE_DB) {
+      const r = await pool.query(`
+        SELECT 'brief' AS type, id, data->>'title' AS title, created_at
+          FROM episodes WHERE mode = 'brief' AND user_id = $1
+        UNION ALL
+        SELECT 'deepdive' AS type, id, data->>'topic' AS title, created_at
+          FROM series WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT 200`, [userId]);
+      return r.rows.map(x => ({ type: x.type, id: x.id, title: x.title, createdAt: x.created_at }));
+    }
+    return _library.filter(i => i.userId === userId);
+  },
+
+  /* ---- users / accounts ---- */
+  async createUser(u) {
+    _users.set(u.id, u); if (u.token) _tokenIndex.set(u.token, u.id);
+    if (USE_DB) await pool.query(
+      `INSERT INTO users (id, token, tier, gen_count, period_start) VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (id) DO UPDATE SET token=EXCLUDED.token, tier=EXCLUDED.tier,
+         gen_count=EXCLUDED.gen_count, period_start=EXCLUDED.period_start`,
+      [u.id, u.token, u.tier, u.gen_count, u.period_start]);
+    return u;
+  },
+  async updateUser(u) { return store.createUser(u); },
+  async getUser(uId) {
+    if (_users.has(uId)) return _users.get(uId);
+    if (USE_DB) {
+      const r = await pool.query('SELECT * FROM users WHERE id=$1', [uId]);
+      if (r.rows[0]) { _users.set(uId, r.rows[0]); if (r.rows[0].token) _tokenIndex.set(r.rows[0].token, uId); return r.rows[0]; }
+    }
+    return null;
+  },
+  async getUserByToken(token) {
+    if (_tokenIndex.has(token)) return _users.get(_tokenIndex.get(token));
+    if (USE_DB) {
+      const r = await pool.query('SELECT * FROM users WHERE token=$1', [token]);
+      if (r.rows[0]) { _users.set(r.rows[0].id, r.rows[0]); _tokenIndex.set(token, r.rows[0].id); return r.rows[0]; }
+    }
+    return null;
+  },
 };
 
-const briefingCache = {};
-const scheduleStore = {};
+/* ---------- time windows ------------------------------------------------ */
+const WINDOW_HOURS = { '12h': 12, '24h': 24, '48h': 48, '72h': 72, '1w': 168 };
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+/* ---------- deep dive depth -> episode count ---------------------------- */
+const DEPTH = {
+  enough_to_be_dangerous: { episodes: 1, label: 'Enough to be dangerous' },
+  conversational:         { episodes: 3, label: 'Conversational' },
+  well_versed:            { episodes: 5, label: 'Well-versed' },
+  black_belt:             { episodes: 7, label: 'Black Belt' },
+};
+
+/* =========================================================================
+   ACCOUNTS & TIERS
+   - Each request resolves to a user via "Authorization: Bearer <token>".
+   - If no/invalid token, it falls back to a shared "anon" free account, so
+     the app keeps working during integration. Anon is still subject to the
+     free limit, so there's no "no-token = unlimited" loophole.
+   - Monthly generation limits enforced per tier; voices and Pro features
+     gated per tier. Tier is set by billing later via /api/admin/set-tier.
+   Tunable via env: FREE_LIMIT (5), PLUS_LIMIT (30), BLACK_BELT_MIN_TIER (free),
+   ADMIN_TOKEN (for setting tiers).
+   ========================================================================= */
+const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
+const PLUS_LIMIT = parseInt(process.env.PLUS_LIMIT || '30', 10);
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const TIER_RANK = { free: 0, plus: 1, pro: 2 };
+
+// ⚠️ PRODUCT DECISIONS (flip these freely):
+const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N generations (default 1)
+const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'free'; // 'free' = open to all
+
+function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
+function periodKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
+function ensurePeriod(user) {
+  const k = periodKey();
+  if (user.period_start !== k) { user.period_start = k; user.gen_count = 0; }
+}
+function voiceAllowed(user, voiceId) {
+  const v = VOICES[voiceId] || VOICES.josh;
+  return TIER_RANK[user.tier] >= TIER_RANK[v.tier];
+}
+
+// Resolve the user for a request (token -> user, else shared anon account).
+async function getReqUser(req) {
+  const h = req.headers['authorization'] || '';
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (m) { const u = await store.getUserByToken(m[1].trim()); if (u) return u; }
+  let anon = await store.getUser('anon');
+  if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
+  return anon;
+}
+
+// Reserve a generation against the user's monthly limit. Returns false if over.
+async function reserveGeneration(user, count) {
+  ensurePeriod(user);
+  const lim = limitFor(user.tier);
+  if (user.gen_count + count > lim) return false;
+  user.gen_count += count;
+  await store.updateUser(user);
+  return true;
+}
+
+/* =========================================================================
+   RETRIEVAL — real, recent, time-windowed sources (topic-routed)
+   Providers, by topic:
+     - General topics : Google News RSS (keyless) + Currents (if key set)
+     - Finance topics : Marketaux (if key set) + Google News RSS
+   Design rules:
+     - Google News RSS is the always-on backbone (keyless), so retrieval
+       never hard-fails even if the keyed providers are missing or down.
+     - Any provider that lacks a key or errors is skipped silently ([]).
+     - Results are deduped across providers and filtered to the time window.
+     - Per-(topic,window) results are cached briefly to respect rate limits
+       (the right pattern for a paid app: cache + schedule, not per-request).
+   Optional env vars: CURRENTS_API_KEY, MARKETAUX_API_KEY
+   ========================================================================= */
+const CURRENTS_API_KEY  = process.env.CURRENTS_API_KEY  || '';
+const MARKETAUX_API_KEY = process.env.MARKETAUX_API_KEY || '';
+
+// Best-effort finance detector. Misses only cost a finance topic its
+// finance-specific provider — Google News still covers it — so we keep this
+// conservative to avoid injecting finance noise into non-finance topics.
+const FINANCE_KEYWORDS = [
+  'stock', 'stocks', 'share price', 'stock market', 'markets', 'finance', 'financial',
+  'earnings', 'ipo', 'nasdaq', 'dow jones', 's&p 500', 'sp500', 'nyse', 'bonds',
+  'treasury yield', 'federal reserve', 'interest rate', 'rate hike', 'rate cut',
+  'inflation', 'crypto', 'bitcoin', 'ethereum', 'etf', 'dividend', 'hedge fund',
+  'wall street', 'forex', 'commodities', 'oil price', 'merger', 'acquisition', 'valuation',
+];
+function isFinanceTopic(topic) {
+  const t = String(topic).toLowerCase();
+  return FINANCE_KEYWORDS.some(k => t.includes(k));
+}
+
+function hostnameOf(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+function dedupeSources(items) {
+  const seen = new Set();
+  const out = [];
+  for (const s of items) {
+    const key = (s.url || s.title || '').toLowerCase().split('?')[0];
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
+// short cache so we don't hit news APIs on every single request
+const retrievalCache = new Map(); // "topic|window" -> { at, data }
+const RETRIEVAL_TTL_MS = 15 * 60 * 1000;
+
+/* ---- providers (each returns [] on any failure; never throws) ---------- */
+async function fromGoogleNews(topic, cutoff) {
+  try {
+    const feed = await rss.parseURL(
+      'https://news.google.com/rss/search?q=' + encodeURIComponent(topic) + '&hl=en-US&gl=US&ceid=US:en'
+    );
+    const out = [];
+    for (const item of feed.items || []) {
+      const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
+      if (isNaN(ts) || ts < cutoff) continue;
+      const parts = (item.title || '').split(' - '); // "Headline - Publisher"
+      const publisher = parts.length > 1 ? parts.pop() : (item.creator || 'News');
+      out.push({
+        topic, publisher, title: parts.join(' - ') || item.title, url: item.link,
+        publishedAt: new Date(ts).toISOString(),
+        snippet: (item.contentSnippet || '').slice(0, 280), provider: 'google_news',
+      });
+    }
+    return out;
+  } catch (e) { console.log('google_news error:', e.message); return []; }
+}
+
+async function fromCurrents(topic, cutoff) {
+  if (!CURRENTS_API_KEY) return [];
+  try {
+    const url = 'https://api.currentsapi.services/v1/search?language=en&keywords='
+      + encodeURIComponent(topic) + '&start_date=' + encodeURIComponent(new Date(cutoff).toISOString())
+      + '&apiKey=' + CURRENTS_API_KEY;
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.news || []).map(n => ({
+      topic, publisher: hostnameOf(n.url) || n.author || 'Currents',
+      title: n.title, url: n.url,
+      publishedAt: n.published ? new Date(n.published).toISOString() : null,
+      snippet: (n.description || '').slice(0, 280), provider: 'currents',
+    })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
+  } catch (e) { console.log('currents error:', e.message); return []; }
+}
+
+async function fromMarketaux(topic, cutoff) {
+  if (!MARKETAUX_API_KEY) return [];
+  try {
+    const after = new Date(cutoff).toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
+    const url = 'https://api.marketaux.com/v1/news/all?language=en&search='
+      + encodeURIComponent(topic) + '&published_after=' + encodeURIComponent(after)
+      + '&api_token=' + MARKETAUX_API_KEY;
+    const r = await fetch(url);
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.data || []).map(n => ({
+      topic, publisher: n.source || hostnameOf(n.url) || 'Marketaux',
+      title: n.title, url: n.url,
+      publishedAt: n.published_at ? new Date(n.published_at).toISOString() : null,
+      snippet: (n.snippet || n.description || '').slice(0, 280), provider: 'marketaux',
+    })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
+  } catch (e) { console.log('marketaux error:', e.message); return []; }
+}
+
+/* ---- one topic, routed ------------------------------------------------- */
+async function retrieveForTopic(topic, windowKey) {
+  const cacheKey = String(topic).toLowerCase() + '|' + windowKey;
+  const cached = retrievalCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
+
+  const hours = WINDOW_HOURS[windowKey] || 24;
+  const cutoff = Date.now() - hours * 3600 * 1000;
+
+  let results;
+  if (MOCK_MODE) {
+    const finance = isFinanceTopic(topic);
+    results = [{
+      topic,
+      publisher: finance ? 'MarketWatch' : 'Reuters',
+      title: 'Recent development in ' + topic,
+      url: 'https://example.com/' + encodeURIComponent(topic),
+      publishedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+      snippet: 'Mock ' + (finance ? 'finance ' : '') + 'article about ' + topic + '.',
+      provider: finance ? 'marketaux(mock)' : 'google_news(mock)',
+    }];
+  } else {
+    const jobs = isFinanceTopic(topic)
+      ? [fromMarketaux(topic, cutoff), fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)]
+      : [fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)];
+    const settled = await Promise.allSettled(jobs);
+    results = [];
+    for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+    results = dedupeSources(results)
+      .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+      .slice(0, 12); // per-topic cap
+  }
+  retrievalCache.set(cacheKey, { at: Date.now(), data: results });
+  return results;
+}
+
+/* ---- all topics -------------------------------------------------------- */
+async function retrieveSources(topics, windowKey) {
+  const perTopic = await Promise.all(topics.map(t => retrieveForTopic(t, windowKey)));
+  const all = [];
+  for (const arr of perTopic) all.push(...arr);
+  return dedupeSources(all)
+    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+    .slice(0, 40);
+}
+
+/* =========================================================================
+   RESILIENCE & CONCURRENCY (optimization)
+   - Content-addressed audio cache: identical (voice, text) is synthesized
+     once and then reused forever — never re-bills ElevenLabs for the same
+     audio (replays, overlapping topics, retries all hit the cache).
+   - Concurrency limiters cap simultaneous LLM/TTS calls so a burst of users
+     can't overload the box or trip provider rate limits.
+   - Retry-with-backoff + timeout wraps the flaky external calls.
+   Tunable env: TTS_CONCURRENCY (3), LLM_CONCURRENCY (4).
+   ========================================================================= */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function makeLimiter(max) {
+  let active = 0; const q = [];
+  const pump = () => {
+    if (active >= max || q.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = q.shift();
+    Promise.resolve().then(fn).then(resolve, reject).finally(() => { active--; pump(); });
+  };
+  return (fn) => new Promise((resolve, reject) => { q.push({ fn, resolve, reject }); pump(); });
+}
+const ttsLimit = makeLimiter(parseInt(process.env.TTS_CONCURRENCY || '3', 10));
+const llmLimit = makeLimiter(parseInt(process.env.LLM_CONCURRENCY || '4', 10));
+
+async function fetchWithRetry(url, opts, cfg) {
+  const { tries = 3, baseDelay = 500, timeoutMs = 30000 } = cfg || {};
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    const ctrl = new AbortController();
+    const to = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
+      clearTimeout(to);
+      if ((r.status === 429 || r.status >= 500) && i < tries - 1) { await sleep(baseDelay * (2 ** i)); continue; }
+      return r;
+    } catch (e) {
+      clearTimeout(to); lastErr = e;
+      if (i < tries - 1) { await sleep(baseDelay * (2 ** i)); continue; }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+function audioKey(voiceId, text) {
+  return crypto.createHash('sha256').update(voiceId + '\n' + text).digest('hex');
+}
+let synthCount = 0; // real (non-cached) synth calls — observability / tests
+
+/* =========================================================================
+   SCRIPT WRITING (Claude) — grounded in retrieved sources for Briefs
+   ========================================================================= */
+async function callClaude(prompt, maxTokens) {
+  if (MOCK_MODE) {
+    return 'MOCK SCRIPT. ' + 'This is placeholder narration generated without API keys. '.repeat(40);
+  }
+  const r = await llmLimit(() => fetchWithRetry('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens || 4096,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  }, { tries: 3, timeoutMs: 60000 }));
+  const d = await r.json();
+  if (!d.content || !d.content[0]) throw new Error('Claude error: ' + JSON.stringify(d).slice(0, 300));
+  return d.content[0].text.trim();
+}
+
+function sourcesBlock(sources) {
+  if (!sources.length) return '(No recent sources were found in the chosen time window.)';
+  return sources.map((s, i) =>
+    (i + 1) + '. [' + s.publisher + '] ' + s.title + ' (' + s.publishedAt + ')\n   ' + (s.snippet || '')
+  ).join('\n');
+}
+
+async function writeBriefScript(topics, windowKey, sources, lengthMin) {
+  const targetWords = Math.round(lengthMin * 150);
+  const prompt =
+    'You are the narrator of a personal audio briefing. Write a single spoken-word script of about ' +
+    targetWords + ' words covering these topics: ' + topics.join(', ') + '.\n\n' +
+    'Use ONLY the source material below. Do not invent facts, numbers, or quotes. If a topic has no ' +
+    'sources, say briefly that there were no notable updates in the chosen window for it.\n\n' +
+    'Write it to be spoken aloud: warm, clear, no headers, no bullet points, no stage directions. ' +
+    'Open with a one-line greeting, then move topic to topic with smooth transitions, then a brief sign-off.\n\n' +
+    'SOURCE MATERIAL (published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours):\n' +
+    sourcesBlock(sources);
+  return callClaude(prompt, 8192);
+}
+
+async function writeDeepDivePlan(topic, depthKey) {
+  const n = (DEPTH[depthKey] || DEPTH.conversational).episodes;
+  if (MOCK_MODE) {
+    return Array.from({ length: n }, (_, i) => 'Part ' + (i + 1) + ': ' + topic);
+  }
+  const prompt =
+    'Plan a ' + n + '-episode audio mini-series that takes a listener from zero to "' +
+    (DEPTH[depthKey] || DEPTH.conversational).label + '" knowledge of: ' + topic + '.\n' +
+    'Return ONLY the ' + n + ' episode titles, one per line, no numbering, no extra text. ' +
+    'Order them so each builds on the last.';
+  const text = await callClaude(prompt, 1024);
+  const titles = text.split('\n').map(t => t.replace(/^\s*[-\d.)]+\s*/, '').trim()).filter(Boolean);
+  while (titles.length < n) titles.push(topic + ' — Part ' + (titles.length + 1));
+  return titles.slice(0, n);
+}
+
+async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN) {
+  const targetWords = Math.round(lengthMin * 150);
+  const prompt =
+    'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
+    '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + '). ' +
+    'Conversational and clear, no headers or bullet points, written to be heard not read. ' +
+    'Briefly connect to the series arc, teach the core ideas with concrete examples, and end with a ' +
+    'one-line bridge to what comes next.';
+  return callClaude(prompt, 8192);
+}
+
+/* =========================================================================
+   SEGMENTATION + SYNTHESIS (fast start)
+   ========================================================================= */
+function splitIntoSegments(scriptText, wordsPerSegment) {
+  const wps = wordsPerSegment || 200;
+  // split on sentence boundaries, then pack into ~wps-word segments
+  const sentences = scriptText.replace(/\s+/g, ' ').match(/[^.!?]+[.!?]+|\S+$/g) || [scriptText];
+  const segments = [];
+  let buf = [];
+  let count = 0;
+  for (const s of sentences) {
+    const w = s.trim().split(' ').length;
+    buf.push(s.trim());
+    count += w;
+    if (count >= wps) { segments.push(buf.join(' ')); buf = []; count = 0; }
+  }
+  if (buf.length) segments.push(buf.join(' '));
+  return segments.length ? segments : [scriptText];
+}
+
+async function synthesizeToFile(text, voiceId) {
+  // content-addressed: identical (voice, text) reuses the same file forever
+  const key = audioKey(voiceId, text);
+  const fileName = key + '.mp3';
+  const filePath = path.join(AUDIO_DIR, fileName);
+  if (fs.existsSync(filePath)) {
+    return { fileId: key, url: '/audio/' + fileName, cached: true }; // cache hit — no API call, no bill
+  }
+  if (MOCK_MODE) {
+    fs.writeFileSync(filePath, Buffer.from('MOCK_AUDIO_' + key));
+    synthCount++;
+    return { fileId: key, url: '/audio/' + fileName, bytes: 0, cached: false };
+  }
+  const voice = resolveVoice(voiceId);
+  const r = await ttsLimit(() => fetchWithRetry('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
+    body: JSON.stringify({
+      text,
+      model_id: 'eleven_multilingual_v2',
+      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+    }),
+  }, { tries: 3, timeoutMs: 45000 }));
+  if (!r.ok) throw new Error('ElevenLabs ' + r.status + ': ' + (await r.text()).slice(0, 200));
+  const buf = Buffer.from(await r.arrayBuffer());
+  fs.writeFileSync(filePath, buf);
+  synthCount++;
+  return { fileId: key, url: '/audio/' + fileName, bytes: buf.length, cached: false };
+}
+
+function absolute(url) { return PUBLIC_BASE_URL ? PUBLIC_BASE_URL + url : url; }
+
+/* Generate ALL segments for one episode, in order, marking each ready as it
+   finishes so the player can start on segment 1 immediately. Persists after
+   each segment so the manifest reflects progress even after a restart.      */
+async function generateEpisodeSegments(ep, scriptText) {
+  const parts = splitIntoSegments(scriptText, 200);
+  ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
+  await store.updateEpisode(ep);
+  for (let i = 0; i < parts.length; i++) {
+    try {
+      const { url } = await synthesizeToFile(parts[i], ep.voiceId);
+      ep.segments[i].status = 'ready';
+      ep.segments[i].audioUrl = absolute(url);
+      ep.segments[i].text = parts[i];
+    } catch (e) {
+      ep.segments[i].status = 'failed';
+      ep.segments[i].error = e.message;
+      console.log('segment synth failed:', e.message);
+    }
+    await store.updateEpisode(ep); // persist progress segment-by-segment
+  }
+  ep.status = ep.segments.every(s => s.status === 'ready') ? 'complete' : 'partial';
+  await store.updateEpisode(ep);
+}
+
+/* =========================================================================
+   REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
+   ========================================================================= */
+async function buildBriefEpisode(user, cfg, opts) {
+  const { topics, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
+  const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
+  const epId = id('ep');
+  const ep = {
+    id: epId, mode: 'brief', userId: user.id, status: 'generating',
+    title: 'Your Brief — ' + new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+    topics: cleanTopics, window, lengthMin, voiceId,
+    segments: [], sources: [], createdAt: now(),
+  };
+  await store.saveEpisode(ep);
+  const run = (async () => {
+    try {
+      ep.sources = await retrieveSources(cleanTopics, window);
+      await store.updateEpisode(ep);
+      const script = await writeBriefScript(cleanTopics, window, ep.sources, lengthMin);
+      await generateEpisodeSegments(ep, script);
+      await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
+    } catch (e) {
+      ep.status = 'failed'; ep.error = e.message;
+      await store.updateEpisode(ep);
+      console.log('brief pipeline failed:', e.message);
+    }
+  })();
+  if (opts && opts.await) await run;
+  return ep;
+}
+
+/* =========================================================================
+   SCHEDULER — pre-generates Pro users' briefs ahead of their chosen times,
+   in their timezone, so the episode is ready when they open the app.
+   A tick runs every minute. For each schedule, if the user is still Pro and
+   the local time is within the run window for a scheduled time (and it hasn't
+   already run today), it kicks off a brief. The episode generates in the
+   background (fast-start applies), and the schedule records the episode id so
+   the app can surface "your brief is ready" via GET /api/today.
+   ========================================================================= */
+const SCHED_LEAD_MIN = 10;   // start up to 10 min before the target time
+const SCHED_WINDOW_MIN = 60; // ...and still catch up to 60 min after (if worker was down)
+
+function localParts(tz) {
+  try {
+    const fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz || 'America/New_York', hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+    const p = Object.fromEntries(fmt.formatToParts(new Date()).map(x => [x.type, x.value]));
+    let hour = parseInt(p.hour, 10); if (hour === 24) hour = 0;
+    return { date: p.year + '-' + p.month + '-' + p.day, minutesOfDay: hour * 60 + parseInt(p.minute, 10) };
+  } catch (e) {
+    const d = new Date();
+    return { date: d.toISOString().slice(0, 10), minutesOfDay: d.getUTCHours() * 60 + d.getUTCMinutes() };
+  }
+}
+
+function dueTimes(schedule, lp) {
+  const due = [];
+  for (const t of schedule.times || []) {
+    const [hh, mm] = String(t).split(':').map(Number);
+    const target = (hh || 0) * 60 + (mm || 0);
+    const already = (schedule.lastRuns || {})[t] === lp.date;
+    if (!already && lp.minutesOfDay >= target - SCHED_LEAD_MIN && lp.minutesOfDay <= target + SCHED_WINDOW_MIN) {
+      due.push(t);
+    }
+  }
+  return due;
+}
+
+async function tickSchedules() {
+  const all = await store.listAllSchedules();
+  for (const sc of all) {
+    const user = await store.getUser(sc.userId);
+    if (!user || TIER_RANK[user.tier] < TIER_RANK['pro']) continue; // Pro-only; skip if downgraded
+    const lp = localParts(sc.timezone);
+    for (const t of dueTimes(sc, lp)) {
+      try {
+        const ep = await buildBriefEpisode(user, sc.config, { await: false });
+        sc.lastRuns = Object.assign({}, sc.lastRuns, { [t]: lp.date });
+        sc.lastEpisodeId = ep.id;
+        sc.lastGeneratedDate = lp.date;
+        await store.saveSchedule(sc);
+        console.log('scheduled brief generated:', sc.userId, t, '->', ep.id);
+      } catch (e) {
+        console.log('schedule run failed:', e.message);
+      }
+    }
+  }
+}
+
+/* =========================================================================
+   ENDPOINTS
+   ========================================================================= */
+
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.5', mock: MOCK_MODE, db: USE_DB }));
 
 app.get('/api/voices', (req, res) => {
-  res.json(Object.entries(VOICES).map(([key, v]) => ({ key, name: v.name, desc: v.name })));
+  res.json({
+    voices: Object.entries(VOICES).map(([key, v]) => ({
+      id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
+    })),
+  });
 });
 
-app.get('/api/channels', (req, res) => {
-  res.json([
-    { id: 'world',         name: 'World News',           symbol: 'globe',                      color: '#4F9CF0' },
-    { id: 'politics',      name: 'US Politics',           symbol: 'building.columns.fill',      color: '#D06B6B' },
-    { id: 'technology',    name: 'Technology',            symbol: 'cpu',                        color: '#7C8CF8' },
-    { id: 'markets',       name: 'Markets & Finance',     symbol: 'chart.line.uptrend.xyaxis',  color: '#4FCB8B' },
-    { id: 'science',       name: 'Science',               symbol: 'atom',                       color: '#F0A04F' },
-    { id: 'health',        name: 'Health',                symbol: 'heart.fill',                 color: '#F06F8C' },
-    { id: 'sports',        name: 'Sports',                symbol: 'sportscourt.fill',           color: '#4FC8F0' },
-    { id: 'entertainment', name: 'Entertainment',         symbol: 'star.fill',                  color: '#C87CF8' },
-    { id: 'climate',       name: 'Climate & Environment', symbol: 'leaf.fill',                  color: '#4FCB8B' },
-    { id: 'business',      name: 'Business',              symbol: 'briefcase.fill',             color: '#F0C44F' },
-  ]);
+/* ----- accounts --------------------------------------------------------- */
+// App calls this once on first launch, stores the token, and sends it as
+// "Authorization: Bearer <token>" on every request thereafter.
+app.post('/api/auth/register', async (req, res) => {
+  const u = {
+    id: id('usr'),
+    token: crypto.randomBytes(24).toString('hex'),
+    tier: 'free', gen_count: 0, period_start: periodKey(),
+  };
+  await store.createUser(u);
+  res.json({ userId: u.id, token: u.token, tier: u.tier });
 });
 
-app.post('/api/schedule', (req, res) => {
-  const { enabled, time, channelIds } = req.body;
-  if (enabled === undefined || !time || !channelIds) {
-    return res.status(400).json({ error: 'Missing required fields' });
-  }
-  const sortedChannelIds = channelIds.slice().sort();
-  const scheduleKey = sortedChannelIds.join('+');
-  if (enabled) {
-    scheduleStore[scheduleKey] = { enabled: true, time, channelIds: sortedChannelIds, updatedAt: new Date().toISOString() };
-    console.log('Schedule saved:', scheduleKey, 'at', time);
-  } else {
-    delete scheduleStore[scheduleKey];
-    console.log('Schedule removed:', scheduleKey);
-  }
-  res.status(200).json({});
+// The app reads this for the "X left this month" counter.
+app.get('/api/me', async (req, res) => {
+  const user = await getReqUser(req);
+  ensurePeriod(user);
+  const lim = limitFor(user.tier);
+  res.json({
+    userId: user.id, tier: user.tier,
+    used: user.gen_count,
+    limit: lim === Infinity ? 'unlimited' : lim,
+    remaining: lim === Infinity ? 'unlimited' : Math.max(0, lim - user.gen_count),
+    resetsMonthly: true,
+  });
 });
 
-app.post('/api/briefing', async (req, res) => {
-  const { channels, channelIds, topics, episodeLength, maxWords, date, timestamp, timezone } = req.body;
-  const mins = episodeLength || 5;
-  const wordLimit = maxWords || 400;
-  const briefingDate = date || new Date().toISOString().split('T')[0];
-  const briefingTimestamp = timestamp || new Date().toISOString();
-  const sortedTopics = (topics || []).slice().sort();
-  const topicsHash = crypto.createHash('sha1').update(sortedTopics.join('|')).digest('hex').slice(0, 8);
-  const sortedChannelIds = (channelIds || []).slice().sort();
-  const cacheKey = sortedChannelIds.join('+') + '_' + briefingDate + '_' + mins + '_' + topicsHash;
-
-  if (briefingCache[cacheKey]) {
-    console.log('Cache hit:', cacheKey);
-    return res.json(briefingCache[cacheKey]);
-  }
-
-  const channelList = (channels || []).join(', ');
-  const topicList = sortedTopics.length ? sortedTopics.join(', ') : null;
-  const dateLabel = new Date(briefingTimestamp).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-
-  const prompt = 'You are a professional news anchor delivering a morning briefing podcast. ' +
-    'Today is ' + dateLabel + ' (' + briefingTimestamp + '). ' +
-    'Write a morning briefing script covering these topic channels: ' + channelList + '.' +
-    (topicList ? ' Also specifically cover these focus areas: ' + topicList + '.' : '') +
-    ' The script must be ' + wordLimit + ' words or less. ' +
-    'Write in a natural, conversational podcast style — punchy, clear, and engaging. ' +
-    'Start with "Good morning." and cover the most important developments across each area. ' +
-    'Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: ' +
-    '{"title":"Morning Briefing — ' + dateLabel + '","subtitle":"' + dateLabel + '","teaser":"One sentence summary of top stories.","script":"The full spoken script here.","sources":["Reuters","Associated Press","BBC News"]}' +
-    ' For sources, list the real news outlets that cover these topics (e.g. Reuters, Associated Press, BBC News, Bloomberg, ESPN). List one per topic or channel covered.';
-
-  try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const d = await r.json();
-    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
-    let text = d.content[0].text.trim();
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
-    text = text.slice(start, end + 1);
-    const parsed = JSON.parse(text);
-    briefingCache[cacheKey] = parsed;
-    console.log('Cache set:', cacheKey);
-    res.json(parsed);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+// Billing seam: RevenueCat/Stripe (or you, manually) set a user's tier here.
+app.post('/api/admin/set-tier', async (req, res) => {
+  if (!ADMIN_TOKEN || req.headers['x-admin-token'] !== ADMIN_TOKEN)
+    return res.status(403).json({ error: 'forbidden' });
+  const { userId, tier } = req.body || {};
+  if (!['free', 'plus', 'pro'].includes(tier)) return res.status(400).json({ error: 'bad tier' });
+  const user = await store.getUser(userId);
+  if (!user) return res.status(404).json({ error: 'no such user' });
+  user.tier = tier;
+  await store.updateUser(user);
+  res.json({ userId, tier });
 });
 
-app.post('/api/generate', async (req, res) => {
-  const { topic, episodeLength } = req.body;
-  if (!topic) return res.status(400).json({ error: 'Topic required' });
-  const mins = episodeLength === 'ai' ? 5 : parseInt(episodeLength);
-  const wordsPerMinute = 150;
-  const targetWords = mins * wordsPerMinute;
-  const prompt = 'Create a 3-episode podcast series about "' + topic + '". Each episode script should be approximately ' + targetWords + ' words long to fill ' + mins + ' minutes of audio. Return ONLY a raw JSON object with no markdown, no code fences, and no explanation. Use this exact structure: {"series_title":"short catchy title","series_subtitle":"one sentence description","episodes":[{"episode_number":1,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":2,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."},{"episode_number":3,"title":"episode title","duration_minutes":' + mins + ',"teaser":"one sentence hook","script":"Full ' + targetWords + '-word podcast script here."}]}';
-  try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8192, messages: [{ role: 'user', content: prompt }] }),
-    });
-    const d = await r.json();
-    if (!d.content || !d.content[0]) return res.status(500).json({ error: 'AI error: ' + JSON.stringify(d) });
-    let text = d.content[0].text.trim();
-    const start = text.indexOf('{');
-    const end = text.lastIndexOf('}');
-    if (start === -1 || end === -1) return res.status(500).json({ error: 'No JSON found', raw: text.slice(0, 200) });
-    text = text.slice(start, end + 1);
-    try {
-      const parsed = JSON.parse(text);
-      if (!parsed.episodes || parsed.episodes.length < 3) return res.status(500).json({ error: 'Incomplete response', raw: text.slice(0, 200) });
-      res.json(parsed);
-    } catch (parseErr) {
-      res.status(500).json({ error: 'JSON parse failed: ' + parseErr.message, raw: text.slice(0, 300) });
+/* ----- GET BRIEFED ------------------------------------------------------ */
+app.post('/api/brief', async (req, res) => {
+  const { topics = [], window = '24h', lengthMin = 10, voiceId = 'josh' } = req.body || {};
+  const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
+  if (!cleanTopics.length) return res.status(400).json({ error: 'Add at least one topic.' });
+  if (!WINDOW_HOURS[window]) return res.status(400).json({ error: 'Invalid window.' });
+
+  const user = await getReqUser(req);
+  if (!voiceAllowed(user, voiceId))
+    return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
+  if (!(await reserveGeneration(user, 1)))
+    return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
+
+  const epId = id('ep');
+  const ep = await buildBriefEpisode(user, { topics: cleanTopics, window, lengthMin, voiceId });
+  res.json({ episodeId: ep.id, status: ep.status });
+});
+
+/* ----- DEEP DIVE -------------------------------------------------------- */
+app.post('/api/deepdive', async (req, res) => {
+  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'josh' } = req.body || {};
+  const t = String(topic || '').trim();
+  if (!t) return res.status(400).json({ error: 'Enter a topic.' });
+  if (!DEPTH[depth]) return res.status(400).json({ error: 'Invalid depth.' });
+
+  const user = await getReqUser(req);
+  if (!voiceAllowed(user, voiceId))
+    return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
+  if (depth === 'black_belt' && TIER_RANK[user.tier] < TIER_RANK[BLACK_BELT_MIN_TIER])
+    return res.status(403).json({ error: 'feature_locked', message: 'Black Belt needs a paid plan.' });
+  if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
+    return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
+
+  const serId = id('ser');
+  const series = {
+    id: serId, userId: user.id, topic: t, depth, episodeLengthMin, voiceId,
+    label: DEPTH[depth].label, episodes: [], createdAt: now(), status: 'planning',
+  };
+  await store.saveSeries(series);
+
+  let titles;
+  try { titles = await writeDeepDivePlan(t, depth); }
+  catch (e) { return res.status(500).json({ error: 'Planning failed: ' + e.message }); }
+
+  // create episode shells
+  series.episodes = [];
+  for (let i = 0; i < titles.length; i++) {
+    const epId = id('ep');
+    const ep = {
+      id: epId, mode: 'deepdive', userId: user.id, seriesId: serId, index: i + 1, title: titles[i],
+      status: 'queued', voiceId, lengthMin: episodeLengthMin,
+      segments: [], sources: [], createdAt: now(),
+    };
+    await store.saveEpisode(ep);
+    series.episodes.push({ id: epId, index: i + 1, title: titles[i], status: 'queued' });
+  }
+  series.status = 'generating';
+  await store.updateSeries(series);
+  const firstId = series.episodes[0].id;
+  res.json({ seriesId: serId, firstEpisodeId: firstId, plannedEpisodes: series.episodes });
+
+  // generate episode 1 first (fast start), then the rest in the background
+  (async () => {
+    for (let i = 0; i < series.episodes.length; i++) {
+      const ref = series.episodes[i];
+      const ep = await store.getEpisode(ref.id);
+      ep.status = 'generating'; ref.status = 'generating';
+      await store.updateSeries(series);
+      try {
+        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length);
+        await generateEpisodeSegments(ep, script);
+        ref.status = ep.status;
+      } catch (e) {
+        ep.status = 'failed'; ep.error = e.message; ref.status = 'failed';
+        await store.updateEpisode(ep);
+        console.log('deepdive episode failed:', e.message);
+      }
+      await store.updateSeries(series);
     }
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    series.status = 'complete';
+    await store.updateSeries(series);
+    await store.addToLibrary({ type: 'deepdive', id: serId, title: t, createdAt: series.createdAt, userId: user.id });
+  })();
 });
 
-app.post('/api/synthesize', async (req, res) => {
-  const { text, voiceKey } = req.body;
-  const voice = VOICES[voiceKey] || VOICES.alex;
-  try {
-    const r = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-      body: JSON.stringify({ text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } }),
-    });
-    console.log('ElevenLabs status:', r.status);
-    if (!r.ok) {
-      const errText = await r.text();
-      console.log('ElevenLabs error:', errText);
-      return res.status(500).json({ error: 'ElevenLabs error: ' + errText });
-    }
-    const buf = await r.arrayBuffer();
-    console.log('Audio buffer size:', buf.byteLength);
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(Buffer.from(buf));
-  } catch (e) {
-    console.log('Synthesize exception:', e.message);
-    res.status(500).json({ error: e.message });
-  }
+/* ----- manifests (player polls these) ----------------------------------- */
+app.get('/api/episode/:id/manifest', async (req, res) => {
+  const user = await getReqUser(req);
+  const ep = await store.getEpisode(req.params.id);
+  if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
+  res.json(ep);
 });
 
-app.get(/^(?!\/api).*$/, (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.get('/api/series/:id', async (req, res) => {
+  const user = await getReqUser(req);
+  const s = await store.getSeries(req.params.id);
+  if (!s || (s.userId && s.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
+  res.json(s);
+});
+
+/* ----- library ---------------------------------------------------------- */
+app.get('/api/library', async (req, res) => {
+  const user = await getReqUser(req);
+  res.json({ items: await store.getLibrary(user.id) });
+});
+
+/* ----- scheduling (Pro feature; stored now, pre-gen worker comes next) --- */
+app.post('/api/schedule', async (req, res) => {
+  const user = await getReqUser(req);
+  if (TIER_RANK[user.tier] < TIER_RANK['pro'])
+    return res.status(403).json({ error: 'feature_locked', message: 'Scheduled briefs are a Pro feature.' });
+  const { config, times = ['07:00'], timezone = 'America/New_York' } = req.body || {};
+  if (!config || !Array.isArray(config.topics) || !config.topics.length)
+    return res.status(400).json({ error: 'Schedule needs a config with topics.' });
+  const sId = id('sch');
+  const sched = { id: sId, userId: user.id, config, times, timezone, createdAt: now() };
+  await store.saveSchedule(sched);
+  res.json(sched);
+});
+app.get('/api/schedule', async (req, res) => {
+  const user = await getReqUser(req);
+  res.json({ schedules: await store.listSchedules(user.id) });
+});
+
+// The app calls this on open to surface a pre-generated brief ("ready to play").
+app.get('/api/today', async (req, res) => {
+  const user = await getReqUser(req);
+  const scheds = await store.listSchedules(user.id);
+  let episodeId = null;
+  for (const sc of scheds) {
+    const today = localParts(sc.timezone).date;
+    if (sc.lastGeneratedDate === today && sc.lastEpisodeId) episodeId = sc.lastEpisodeId;
+  }
+  if (!episodeId) return res.json({ ready: false });
+  const ep = await store.getEpisode(episodeId);
+  res.json({ ready: true, episodeId, status: ep ? ep.status : 'unknown' });
+});
+
+/* ----- fallback (serve a frontend if one exists) ------------------------ */
+app.get(/^(?!\/api|\/audio).*$/, (req, res) => {
+  const indexHtml = path.join(__dirname, 'public', 'index.html');
+  if (fs.existsSync(indexHtml)) return res.sendFile(indexHtml);
+  res.json({ ok: true, service: 'MyCast backend v9', mock: MOCK_MODE });
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('MyCast v8 on port ' + PORT));
+if (require.main === module) {
+  initDb()
+    .catch(e => console.log('DB init error (continuing in-memory):', e.message))
+    .finally(() => {
+      app.listen(PORT, () =>
+        console.log('MyCast v9.5 on port ' + PORT
+          + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
+          + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
+      // scheduler: tick every minute, plus once shortly after boot
+      setInterval(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 60 * 1000);
+      setTimeout(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 5000);
+    });
+}
+
+// Exported for testing only.
+module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTopic, retrieveSources,
+  tickSchedules, localParts, dueTimes, buildBriefEpisode, store,
+  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount };
+
+/* =========================================================================
+   PRODUCTION NOTES (not code — read before selling)
+   1. PERSISTENCE: state is in-memory and audio is on ephemeral disk, so the
+      Library is wiped on every redeploy/restart. For a real product, add a
+      database (Railway Postgres → DATABASE_URL) for episode/series/library
+      records, and object storage (Cloudflare R2 / S3) for segment audio.
+   2. SCHEDULING: /api/schedule stores configs but nothing generates them
+      yet. Add a cron worker (e.g. node-cron) that, ahead of each scheduled
+      time per user timezone, runs the brief pipeline so it's ready on open.
+   3. ACCOUNTS + LIMITS + BILLING: there is no auth here, so monthly limits
+      and tier gating are advisory (client passes tier). Real enforcement
+      needs user accounts + a billing provider (e.g. RevenueCat/Stripe).
+   4. CONCURRENCY: generation runs in-process. Fine for early users; move
+      heavy generation to a queue/worker when traffic grows.
+   ========================================================================= */
