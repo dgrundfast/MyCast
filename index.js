@@ -1,3 +1,4 @@
+
 /* =========================================================================
    MyCast Backend — v9
    Two modes: GET BRIEFED (stay informed) + DEEP DIVE (build knowledge)
@@ -10,30 +11,30 @@
      script grounded in them. Sources are stored and returned.
    - MOCK_MODE: if API keys are missing, the whole pipeline runs with
      placeholders so the architecture can be tested without keys.
-
+ 
    Env vars (set in Railway → Variables):
      ANTHROPIC_API_KEY   (required for real scripts)
      ELEVENLABS_API_KEY  (required for real audio)
      PORT                (Railway injects this)
      PUBLIC_BASE_URL     (optional; e.g. https://mycast-v0fx-production.up.railway.app)
    ========================================================================= */
-
+ 
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const Parser = require('rss-parser');
-
+ 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
-
+ 
 const AK = process.env.ANTHROPIC_API_KEY || '';
 const EK = process.env.ELEVENLABS_API_KEY || '';
 const MOCK_MODE = !AK || !EK; // no keys -> safe placeholder mode for testing
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ''; // optional absolute URLs
-
+ 
 const rss = new Parser({ timeout: 8000 });
-
+ 
 /* ---------- audio storage (disk; served by URL) -------------------------
    Railway's filesystem is ephemeral (wiped on redeploy/restart). That's
    fine for "listen now" — for durable Library across deploys, swap this
@@ -43,7 +44,7 @@ const rss = new Parser({ timeout: 8000 });
 const AUDIO_DIR = process.env.AUDIO_DIR || path.join(__dirname, 'audio_cache');
 fs.mkdirSync(AUDIO_DIR, { recursive: true });
 app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
-
+ 
 /* ---------- voices ------------------------------------------------------ */
 const VOICES = {
   // FREE — keep these two genuinely good; they're the hook.
@@ -55,7 +56,7 @@ const VOICES = {
   arnold:{ id: 'VR6AewLTigWG4xSOukaG', displayName: 'Arnold',gender: 'male',   tier: 'pro'  },
 };
 function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.josh; }
-
+ 
 /* =========================================================================
    STORAGE — durable when DATABASE_URL is set, in-memory otherwise.
    Strategy: a hot in-memory cache (so in-progress generation mutates a live
@@ -70,16 +71,16 @@ const USE_DB = !!DATABASE_URL;
 const pool = USE_DB
   ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
   : null;
-
+ 
 const id = (p) => p + '_' + crypto.randomBytes(6).toString('hex');
 const now = () => new Date().toISOString();
-
+ 
 // hot cache (also the entire store when USE_DB is false)
 const _episodes = new Map();
 const _series = new Map();
 const _schedules = new Map();
 const _library = []; // newest-first { type, id, title, createdAt } (in-memory mode)
-
+ 
 async function initDb() {
   if (!USE_DB) return;
   await pool.query(`
@@ -106,10 +107,10 @@ async function initDb() {
   }
   console.log('Postgres ready.');
 }
-
+ 
 const _users = new Map();        // userId -> user
 const _tokenIndex = new Map();    // token -> userId
-
+ 
 const store = {
   async saveEpisode(ep) {
     _episodes.set(ep.id, ep);
@@ -181,7 +182,7 @@ const store = {
     }
     return _library.filter(i => i.userId === userId);
   },
-
+ 
   /* ---- users / accounts ---- */
   async createUser(u) {
     _users.set(u.id, u); if (u.token) _tokenIndex.set(u.token, u.id);
@@ -210,10 +211,10 @@ const store = {
     return null;
   },
 };
-
+ 
 /* ---------- time windows ------------------------------------------------ */
 const WINDOW_HOURS = { '12h': 12, '24h': 24, '48h': 48, '72h': 72, '1w': 168 };
-
+ 
 /* ---------- deep dive depth -> episode count ---------------------------- */
 const DEPTH = {
   enough_to_be_dangerous: { episodes: 1, label: 'Enough to be dangerous' },
@@ -221,7 +222,7 @@ const DEPTH = {
   well_versed:            { episodes: 5, label: 'Well-versed' },
   black_belt:             { episodes: 7, label: 'Black Belt' },
 };
-
+ 
 /* =========================================================================
    ACCOUNTS & TIERS
    - Each request resolves to a user via "Authorization: Bearer <token>".
@@ -237,11 +238,11 @@ const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
 const PLUS_LIMIT = parseInt(process.env.PLUS_LIMIT || '30', 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const TIER_RANK = { free: 0, plus: 1, pro: 2 };
-
+ 
 // ⚠️ PRODUCT DECISIONS (flip these freely):
 const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N generations (default 1)
 const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'free'; // 'free' = open to all
-
+ 
 function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
 function periodKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
 function ensurePeriod(user) {
@@ -252,7 +253,7 @@ function voiceAllowed(user, voiceId) {
   const v = VOICES[voiceId] || VOICES.josh;
   return TIER_RANK[user.tier] >= TIER_RANK[v.tier];
 }
-
+ 
 // Resolve the user for a request (token -> user, else shared anon account).
 async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
@@ -262,7 +263,7 @@ async function getReqUser(req) {
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
   return anon;
 }
-
+ 
 // Reserve a generation against the user's monthly limit. Returns false if over.
 async function reserveGeneration(user, count) {
   ensurePeriod(user);
@@ -272,7 +273,7 @@ async function reserveGeneration(user, count) {
   await store.updateUser(user);
   return true;
 }
-
+ 
 /* =========================================================================
    RETRIEVAL — real, recent, time-windowed sources (topic-routed)
    Providers, by topic:
@@ -289,7 +290,7 @@ async function reserveGeneration(user, count) {
    ========================================================================= */
 const CURRENTS_API_KEY  = process.env.CURRENTS_API_KEY  || '';
 const MARKETAUX_API_KEY = process.env.MARKETAUX_API_KEY || '';
-
+ 
 // Best-effort finance detector. Misses only cost a finance topic its
 // finance-specific provider — Google News still covers it — so we keep this
 // conservative to avoid injecting finance noise into non-finance topics.
@@ -304,27 +305,49 @@ function isFinanceTopic(topic) {
   const t = String(topic).toLowerCase();
   return FINANCE_KEYWORDS.some(k => t.includes(k));
 }
-
+ 
+/* Curated preset channels: each tile maps to a tuned set of queries (and
+   provider hints) so a broad interest like "Markets & Finance" produces a
+   clean, reliable briefing instead of whatever a vague typed topic returns. */
+const CHANNELS = {
+  world_news:      { label: 'World News',            queries: ['world news', 'international news today'] },
+  us_politics:     { label: 'US Politics',           queries: ['US politics', 'Congress', 'White House'] },
+  technology:      { label: 'Technology',            queries: ['technology news', 'artificial intelligence', 'tech industry'] },
+  markets_finance: { label: 'Markets & Finance',     queries: ['stock market today', 'Federal Reserve', 'S&P 500 earnings'], finance: true },
+  science:         { label: 'Science',               queries: ['science research', 'scientific discovery'] },
+  health:          { label: 'Health',                queries: ['health news', 'medical research'] },
+  sports:          { label: 'Sports',                queries: ['sports news today'] },
+  entertainment:   { label: 'Entertainment',         queries: ['entertainment news', 'movies music news'] },
+  climate:         { label: 'Climate & Environment', queries: ['climate change news', 'environment news'] },
+  business:        { label: 'Business',              queries: ['business news', 'economy news'] },
+};
+ 
 function hostnameOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
-
+ 
+function normTitle(t) {
+  return String(t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 70);
+}
 function dedupeSources(items) {
   const seen = new Set();
   const out = [];
   for (const s of items) {
-    const key = (s.url || s.title || '').toLowerCase().split('?')[0];
-    if (!key || seen.has(key)) continue;
+    const tkey = normTitle(s.title);                 // collapses the same wire story across many outlets
+    const ukey = (s.url || '').toLowerCase().split('?')[0];
+    const key = tkey || ukey;
+    if (!key || seen.has(key) || (ukey && seen.has('u:' + ukey))) continue;
     seen.add(key);
+    if (ukey) seen.add('u:' + ukey);
     out.push(s);
   }
   return out;
 }
-
+ 
 // short cache so we don't hit news APIs on every single request
 const retrievalCache = new Map(); // "topic|window" -> { at, data }
 const RETRIEVAL_TTL_MS = 15 * 60 * 1000;
-
+ 
 /* ---- providers (each returns [] on any failure; never throws) ---------- */
 async function fromGoogleNews(topic, cutoff) {
   try {
@@ -346,7 +369,7 @@ async function fromGoogleNews(topic, cutoff) {
     return out;
   } catch (e) { console.log('google_news error:', e.message); return []; }
 }
-
+ 
 async function fromCurrents(topic, cutoff) {
   if (!CURRENTS_API_KEY) return [];
   try {
@@ -364,7 +387,7 @@ async function fromCurrents(topic, cutoff) {
     })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
   } catch (e) { console.log('currents error:', e.message); return []; }
 }
-
+ 
 async function fromMarketaux(topic, cutoff) {
   if (!MARKETAUX_API_KEY) return [];
   try {
@@ -383,16 +406,16 @@ async function fromMarketaux(topic, cutoff) {
     })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
   } catch (e) { console.log('marketaux error:', e.message); return []; }
 }
-
+ 
 /* ---- one topic, routed ------------------------------------------------- */
 async function retrieveForTopic(topic, windowKey) {
   const cacheKey = String(topic).toLowerCase() + '|' + windowKey;
   const cached = retrievalCache.get(cacheKey);
   if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
-
+ 
   const hours = WINDOW_HOURS[windowKey] || 24;
   const cutoff = Date.now() - hours * 3600 * 1000;
-
+ 
   let results;
   if (MOCK_MODE) {
     const finance = isFinanceTopic(topic);
@@ -414,12 +437,12 @@ async function retrieveForTopic(topic, windowKey) {
     for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
     results = dedupeSources(results)
       .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
-      .slice(0, 12); // per-topic cap
+      .slice(0, 6); // per-topic cap (keeps one broad topic from flooding the brief)
   }
   retrievalCache.set(cacheKey, { at: Date.now(), data: results });
   return results;
 }
-
+ 
 /* ---- all topics -------------------------------------------------------- */
 async function retrieveSources(topics, windowKey) {
   const perTopic = await Promise.all(topics.map(t => retrieveForTopic(t, windowKey)));
@@ -429,7 +452,53 @@ async function retrieveSources(topics, windowKey) {
     .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
     .slice(0, 40);
 }
-
+ 
+/* ---- one curated channel (runs its tuned queries, labels under channel) - */
+async function retrieveForChannel(channelId, windowKey) {
+  const ch = CHANNELS[channelId];
+  if (!ch) return [];
+  const cacheKey = 'ch:' + channelId + '|' + windowKey;
+  const cached = retrievalCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
+ 
+  const hours = WINDOW_HOURS[windowKey] || 24;
+  const cutoff = Date.now() - hours * 3600 * 1000;
+ 
+  let results;
+  if (MOCK_MODE) {
+    results = [{
+      topic: ch.label, publisher: ch.finance ? 'MarketWatch' : 'Reuters',
+      title: 'Top ' + ch.label + ' story', url: 'https://example.com/' + channelId,
+      publishedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+      snippet: 'Mock ' + ch.label + ' article.', provider: 'mock',
+    }];
+  } else {
+    results = [];
+    for (const q of ch.queries) {
+      const jobs = ch.finance
+        ? [fromMarketaux(q, cutoff), fromGoogleNews(q, cutoff)]
+        : [fromGoogleNews(q, cutoff), fromCurrents(q, cutoff)];
+      const settled = await Promise.allSettled(jobs);
+      for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+    }
+    results = dedupeSources(results.map(r => Object.assign({}, r, { topic: ch.label })))
+      .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+      .slice(0, 6);
+  }
+  retrievalCache.set(cacheKey, { at: Date.now(), data: results });
+  return results;
+}
+ 
+/* ---- combined: curated channels first, then custom topics -------------- */
+async function retrieveAll(topics, channels, windowKey) {
+  const chanArrs = await Promise.all((channels || []).map(c => retrieveForChannel(c, windowKey)));
+  const topicArrs = await Promise.all((topics || []).map(t => retrieveForTopic(t, windowKey)));
+  const all = [];
+  for (const a of chanArrs) all.push(...a);   // channels lead
+  for (const a of topicArrs) all.push(...a);  // then custom topics
+  return dedupeSources(all).slice(0, 40);
+}
+ 
 /* =========================================================================
    RESILIENCE & CONCURRENCY (optimization)
    - Content-addressed audio cache: identical (voice, text) is synthesized
@@ -441,7 +510,7 @@ async function retrieveSources(topics, windowKey) {
    Tunable env: TTS_CONCURRENCY (3), LLM_CONCURRENCY (4).
    ========================================================================= */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
+ 
 function makeLimiter(max) {
   let active = 0; const q = [];
   const pump = () => {
@@ -454,7 +523,7 @@ function makeLimiter(max) {
 }
 const ttsLimit = makeLimiter(parseInt(process.env.TTS_CONCURRENCY || '3', 10));
 const llmLimit = makeLimiter(parseInt(process.env.LLM_CONCURRENCY || '4', 10));
-
+ 
 async function fetchWithRetry(url, opts, cfg) {
   const { tries = 3, baseDelay = 500, timeoutMs = 30000 } = cfg || {};
   let lastErr;
@@ -474,12 +543,12 @@ async function fetchWithRetry(url, opts, cfg) {
   }
   throw lastErr;
 }
-
+ 
 function audioKey(voiceId, text) {
   return crypto.createHash('sha256').update(voiceId + '\n' + text).digest('hex');
 }
 let synthCount = 0; // real (non-cached) synth calls — observability / tests
-
+ 
 /* =========================================================================
    SCRIPT WRITING (Claude) — grounded in retrieved sources for Briefs
    ========================================================================= */
@@ -500,28 +569,41 @@ async function callClaude(prompt, maxTokens) {
   if (!d.content || !d.content[0]) throw new Error('Claude error: ' + JSON.stringify(d).slice(0, 300));
   return d.content[0].text.trim();
 }
-
+ 
 function sourcesBlock(sources) {
   if (!sources.length) return '(No recent sources were found in the chosen time window.)';
-  return sources.map((s, i) =>
-    (i + 1) + '. [' + s.publisher + '] ' + s.title + ' (' + s.publishedAt + ')\n   ' + (s.snippet || '')
-  ).join('\n');
+  const byTopic = {};
+  for (const s of sources) { (byTopic[s.topic || 'General'] = byTopic[s.topic || 'General'] || []).push(s); }
+  let out = '';
+  for (const [topic, arr] of Object.entries(byTopic)) {
+    out += '\n### SOURCES FOR TOPIC: ' + topic + '\n';
+    arr.forEach((s, i) => {
+      out += (i + 1) + '. [' + s.publisher + '] ' + s.title + (s.snippet ? ' — ' + s.snippet : '') + '\n';
+    });
+  }
+  return out;
 }
-
+ 
 async function writeBriefScript(topics, windowKey, sources, lengthMin) {
   const targetWords = Math.round(lengthMin * 150);
   const prompt =
-    'You are the narrator of a personal audio briefing. Write a single spoken-word script of about ' +
-    targetWords + ' words covering these topics: ' + topics.join(', ') + '.\n\n' +
-    'Use ONLY the source material below. Do not invent facts, numbers, or quotes. If a topic has no ' +
-    'sources, say briefly that there were no notable updates in the chosen window for it.\n\n' +
-    'Write it to be spoken aloud: warm, clear, no headers, no bullet points, no stage directions. ' +
-    'Open with a one-line greeting, then move topic to topic with smooth transitions, then a brief sign-off.\n\n' +
-    'SOURCE MATERIAL (published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours):\n' +
+    'You are the narrator of a personal audio briefing. Write ONE spoken-word script of about ' +
+    targetWords + ' words.\n\n' +
+    'Cover the listener\'s topics IN THIS ORDER, giving each its own clear section:\n' +
+    topics.map((t, i) => (i + 1) + '. ' + t).join('\n') + '\n\n' +
+    'Rules:\n' +
+    '- Use ONLY the source material below. It is grouped by topic. For each topic, use ONLY the sources listed under that topic.\n' +
+    '- IGNORE any source that is not clearly about its topic (the news feed sometimes returns loosely-related items — skip those).\n' +
+    '- Do NOT invent facts, numbers, or quotes.\n' +
+    '- If a topic has no relevant sources, say in one short sentence that there were no notable updates for it, then move on.\n' +
+    '- OPEN with a brief one-line greeting that names the topics you\'ll cover. Do NOT open by diving straight into a single story.\n' +
+    '- Move through the topics in the order above; spend proportionally more time on the earlier topics.\n' +
+    '- Spoken aloud: warm, clear, natural transitions, no headers, no bullet points, no stage directions. End with a short sign-off.\n\n' +
+    'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours):\n' +
     sourcesBlock(sources);
   return callClaude(prompt, 8192);
 }
-
+ 
 async function writeDeepDivePlan(topic, depthKey) {
   const n = (DEPTH[depthKey] || DEPTH.conversational).episodes;
   if (MOCK_MODE) {
@@ -537,7 +619,7 @@ async function writeDeepDivePlan(topic, depthKey) {
   while (titles.length < n) titles.push(topic + ' — Part ' + (titles.length + 1));
   return titles.slice(0, n);
 }
-
+ 
 async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN) {
   const targetWords = Math.round(lengthMin * 150);
   const prompt =
@@ -548,7 +630,7 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN) 
     'one-line bridge to what comes next.';
   return callClaude(prompt, 8192);
 }
-
+ 
 /* =========================================================================
    SEGMENTATION + SYNTHESIS (fast start)
    ========================================================================= */
@@ -568,7 +650,7 @@ function splitIntoSegments(scriptText, wordsPerSegment) {
   if (buf.length) segments.push(buf.join(' '));
   return segments.length ? segments : [scriptText];
 }
-
+ 
 async function synthesizeToFile(text, voiceId) {
   // content-addressed: identical (voice, text) reuses the same file forever
   const key = audioKey(voiceId, text);
@@ -598,9 +680,9 @@ async function synthesizeToFile(text, voiceId) {
   synthCount++;
   return { fileId: key, url: '/audio/' + fileName, bytes: buf.length, cached: false };
 }
-
+ 
 function absolute(url) { return PUBLIC_BASE_URL ? PUBLIC_BASE_URL + url : url; }
-
+ 
 /* Generate ALL segments for one episode, in order, marking each ready as it
    finishes so the player can start on segment 1 immediately. Persists after
    each segment so the manifest reflects progress even after a restart.      */
@@ -624,26 +706,28 @@ async function generateEpisodeSegments(ep, scriptText) {
   ep.status = ep.segments.every(s => s.status === 'ready') ? 'complete' : 'partial';
   await store.updateEpisode(ep);
 }
-
+ 
 /* =========================================================================
    REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
    ========================================================================= */
 async function buildBriefEpisode(user, cfg, opts) {
-  const { topics, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
+  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
   const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
+  const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
+  const sectionLabels = [...cleanChannels.map(c => CHANNELS[c].label), ...cleanTopics];
   const epId = id('ep');
   const ep = {
     id: epId, mode: 'brief', userId: user.id, status: 'generating',
     title: 'Your Brief — ' + new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-    topics: cleanTopics, window, lengthMin, voiceId,
+    topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId,
     segments: [], sources: [], createdAt: now(),
   };
   await store.saveEpisode(ep);
   const run = (async () => {
     try {
-      ep.sources = await retrieveSources(cleanTopics, window);
+      ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
       await store.updateEpisode(ep);
-      const script = await writeBriefScript(cleanTopics, window, ep.sources, lengthMin);
+      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin);
       await generateEpisodeSegments(ep, script);
       await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
     } catch (e) {
@@ -655,7 +739,7 @@ async function buildBriefEpisode(user, cfg, opts) {
   if (opts && opts.await) await run;
   return ep;
 }
-
+ 
 /* =========================================================================
    SCHEDULER — pre-generates Pro users' briefs ahead of their chosen times,
    in their timezone, so the episode is ready when they open the app.
@@ -667,7 +751,7 @@ async function buildBriefEpisode(user, cfg, opts) {
    ========================================================================= */
 const SCHED_LEAD_MIN = 10;   // start up to 10 min before the target time
 const SCHED_WINDOW_MIN = 60; // ...and still catch up to 60 min after (if worker was down)
-
+ 
 function localParts(tz) {
   try {
     const fmt = new Intl.DateTimeFormat('en-CA', {
@@ -682,7 +766,7 @@ function localParts(tz) {
     return { date: d.toISOString().slice(0, 10), minutesOfDay: d.getUTCHours() * 60 + d.getUTCMinutes() };
   }
 }
-
+ 
 function dueTimes(schedule, lp) {
   const due = [];
   for (const t of schedule.times || []) {
@@ -695,7 +779,7 @@ function dueTimes(schedule, lp) {
   }
   return due;
 }
-
+ 
 async function tickSchedules() {
   const all = await store.listAllSchedules();
   for (const sc of all) {
@@ -716,13 +800,13 @@ async function tickSchedules() {
     }
   }
 }
-
+ 
 /* =========================================================================
    ENDPOINTS
    ========================================================================= */
-
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.5', mock: MOCK_MODE, db: USE_DB }));
-
+ 
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.7', mock: MOCK_MODE, db: USE_DB }));
+ 
 app.get('/api/voices', (req, res) => {
   res.json({
     voices: Object.entries(VOICES).map(([key, v]) => ({
@@ -730,7 +814,13 @@ app.get('/api/voices', (req, res) => {
     })),
   });
 });
-
+ 
+// Curated channels for the preset tiles (id + label). The app sends selected
+// ids in the `channels` array of POST /api/brief.
+app.get('/api/channels', (req, res) => {
+  res.json({ channels: Object.entries(CHANNELS).map(([id, c]) => ({ id, label: c.label })) });
+});
+ 
 /* ----- accounts --------------------------------------------------------- */
 // App calls this once on first launch, stores the token, and sends it as
 // "Authorization: Bearer <token>" on every request thereafter.
@@ -743,7 +833,7 @@ app.post('/api/auth/register', async (req, res) => {
   await store.createUser(u);
   res.json({ userId: u.id, token: u.token, tier: u.tier });
 });
-
+ 
 // The app reads this for the "X left this month" counter.
 app.get('/api/me', async (req, res) => {
   const user = await getReqUser(req);
@@ -757,7 +847,7 @@ app.get('/api/me', async (req, res) => {
     resetsMonthly: true,
   });
 });
-
+ 
 // Billing seam: RevenueCat/Stripe (or you, manually) set a user's tier here.
 app.post('/api/admin/set-tier', async (req, res) => {
   if (!ADMIN_TOKEN || req.headers['x-admin-token'] !== ADMIN_TOKEN)
@@ -770,32 +860,32 @@ app.post('/api/admin/set-tier', async (req, res) => {
   await store.updateUser(user);
   res.json({ userId, tier });
 });
-
+ 
 /* ----- GET BRIEFED ------------------------------------------------------ */
 app.post('/api/brief', async (req, res) => {
-  const { topics = [], window = '24h', lengthMin = 10, voiceId = 'josh' } = req.body || {};
+  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'josh' } = req.body || {};
   const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
-  if (!cleanTopics.length) return res.status(400).json({ error: 'Add at least one topic.' });
+  const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
+  if (!cleanTopics.length && !cleanChannels.length) return res.status(400).json({ error: 'Add at least one topic or channel.' });
   if (!WINDOW_HOURS[window]) return res.status(400).json({ error: 'Invalid window.' });
-
+ 
   const user = await getReqUser(req);
   if (!voiceAllowed(user, voiceId))
     return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
   if (!(await reserveGeneration(user, 1)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
-
-  const epId = id('ep');
-  const ep = await buildBriefEpisode(user, { topics: cleanTopics, window, lengthMin, voiceId });
+ 
+  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId });
   res.json({ episodeId: ep.id, status: ep.status });
 });
-
+ 
 /* ----- DEEP DIVE -------------------------------------------------------- */
 app.post('/api/deepdive', async (req, res) => {
   const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'josh' } = req.body || {};
   const t = String(topic || '').trim();
   if (!t) return res.status(400).json({ error: 'Enter a topic.' });
   if (!DEPTH[depth]) return res.status(400).json({ error: 'Invalid depth.' });
-
+ 
   const user = await getReqUser(req);
   if (!voiceAllowed(user, voiceId))
     return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
@@ -803,18 +893,18 @@ app.post('/api/deepdive', async (req, res) => {
     return res.status(403).json({ error: 'feature_locked', message: 'Black Belt needs a paid plan.' });
   if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
-
+ 
   const serId = id('ser');
   const series = {
     id: serId, userId: user.id, topic: t, depth, episodeLengthMin, voiceId,
     label: DEPTH[depth].label, episodes: [], createdAt: now(), status: 'planning',
   };
   await store.saveSeries(series);
-
+ 
   let titles;
   try { titles = await writeDeepDivePlan(t, depth); }
   catch (e) { return res.status(500).json({ error: 'Planning failed: ' + e.message }); }
-
+ 
   // create episode shells
   series.episodes = [];
   for (let i = 0; i < titles.length; i++) {
@@ -831,7 +921,7 @@ app.post('/api/deepdive', async (req, res) => {
   await store.updateSeries(series);
   const firstId = series.episodes[0].id;
   res.json({ seriesId: serId, firstEpisodeId: firstId, plannedEpisodes: series.episodes });
-
+ 
   // generate episode 1 first (fast start), then the rest in the background
   (async () => {
     for (let i = 0; i < series.episodes.length; i++) {
@@ -855,7 +945,7 @@ app.post('/api/deepdive', async (req, res) => {
     await store.addToLibrary({ type: 'deepdive', id: serId, title: t, createdAt: series.createdAt, userId: user.id });
   })();
 });
-
+ 
 /* ----- manifests (player polls these) ----------------------------------- */
 app.get('/api/episode/:id/manifest', async (req, res) => {
   const user = await getReqUser(req);
@@ -863,20 +953,20 @@ app.get('/api/episode/:id/manifest', async (req, res) => {
   if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
   res.json(ep);
 });
-
+ 
 app.get('/api/series/:id', async (req, res) => {
   const user = await getReqUser(req);
   const s = await store.getSeries(req.params.id);
   if (!s || (s.userId && s.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
   res.json(s);
 });
-
+ 
 /* ----- library ---------------------------------------------------------- */
 app.get('/api/library', async (req, res) => {
   const user = await getReqUser(req);
   res.json({ items: await store.getLibrary(user.id) });
 });
-
+ 
 /* ----- scheduling (Pro feature; stored now, pre-gen worker comes next) --- */
 app.post('/api/schedule', async (req, res) => {
   const user = await getReqUser(req);
@@ -894,7 +984,7 @@ app.get('/api/schedule', async (req, res) => {
   const user = await getReqUser(req);
   res.json({ schedules: await store.listSchedules(user.id) });
 });
-
+ 
 // The app calls this on open to surface a pre-generated brief ("ready to play").
 app.get('/api/today', async (req, res) => {
   const user = await getReqUser(req);
@@ -908,21 +998,21 @@ app.get('/api/today', async (req, res) => {
   const ep = await store.getEpisode(episodeId);
   res.json({ ready: true, episodeId, status: ep ? ep.status : 'unknown' });
 });
-
+ 
 /* ----- fallback (serve a frontend if one exists) ------------------------ */
 app.get(/^(?!\/api|\/audio).*$/, (req, res) => {
   const indexHtml = path.join(__dirname, 'public', 'index.html');
   if (fs.existsSync(indexHtml)) return res.sendFile(indexHtml);
   res.json({ ok: true, service: 'MyCast backend v9', mock: MOCK_MODE });
 });
-
+ 
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   initDb()
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.5 on port ' + PORT
+        console.log('MyCast v9.7 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -930,12 +1020,12 @@ if (require.main === module) {
       setTimeout(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 5000);
     });
 }
-
+ 
 // Exported for testing only.
 module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTopic, retrieveSources,
   tickSchedules, localParts, dueTimes, buildBriefEpisode, store,
   makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount };
-
+ 
 /* =========================================================================
    PRODUCTION NOTES (not code — read before selling)
    1. PERSISTENCE: state is in-memory and audio is on ephemeral disk, so the
