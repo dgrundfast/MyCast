@@ -429,7 +429,139 @@ async function fromMarketaux(topic, cutoff) {
   } catch (e) { console.log('marketaux error:', e.message); return []; }
 }
 
+/* =========================================================================
+   SPORTS DATA — exact scores/schedule for sports topics.
+   Detect a team in the topic, then pull its most recent result + next game
+   and hand the writer the hard facts (final score, opponent, date) as a
+   top-priority source — instead of vague news snippets.
+   Keyless and fully graceful: any miss/failure -> normal news retrieval.
+   Disable with SPORTS_API_DISABLED=1.
+   NOTE: ESPN's endpoints are unofficial. For production terms, swap the two
+   fetches below to a keyed provider (API-Sports, balldontlie, etc.).
+   ========================================================================= */
+const SPORTS_DISABLED = process.env.SPORTS_API_DISABLED === '1';
+const ESPN = 'https://site.api.espn.com/apis/site/v2/sports';
+const SPORTS_LEAGUES = [
+  { key: 'mlb', sport: 'baseball',   league: 'mlb' },
+  { key: 'nba', sport: 'basketball', league: 'nba' },
+  { key: 'nfl', sport: 'football',   league: 'nfl' },
+  { key: 'nhl', sport: 'hockey',     league: 'nhl' },
+  { key: 'epl', sport: 'soccer',     league: 'eng.1' },
+];
+const teamIndexCache = new Map(); // league.key -> { at, teams:[{id,name,aliases}] }
+const TEAM_TTL = 24 * 3600 * 1000;
+
+async function loadLeagueTeams(lg) {
+  const c = teamIndexCache.get(lg.key);
+  if (c && Date.now() - c.at < TEAM_TTL) return c.teams;
+  if (MOCK_MODE) {
+    const teams = lg.key === 'mlb'
+      ? [{ id: '19', name: 'Los Angeles Dodgers', aliases: ['los angeles dodgers', 'dodgers'] }]
+      : [];
+    teamIndexCache.set(lg.key, { at: Date.now(), teams });
+    return teams;
+  }
+  try {
+    const r = await fetchWithRetry(ESPN + '/' + lg.sport + '/' + lg.league + '/teams', {}, { tries: 2, timeoutMs: 8000 });
+    const d = await r.json();
+    const raw = (((d.sports || [])[0] || {}).leagues || [])[0] || {};
+    const teams = (raw.teams || []).map(x => x.team).filter(Boolean).map(t => {
+      const aliases = new Set();
+      [t.displayName, t.shortDisplayName, t.name, t.nickname, t.location].forEach(a => { if (a) aliases.add(String(a).toLowerCase()); });
+      if (t.location && t.name) aliases.add((t.location + ' ' + t.name).toLowerCase());
+      return { id: t.id, name: t.displayName || t.name, aliases: [...aliases] };
+    });
+    teamIndexCache.set(lg.key, { at: Date.now(), teams });
+    return teams;
+  } catch (e) { console.log('espn teams error [' + lg.key + ']:', e.message); return []; }
+}
+
+async function detectSportsTeam(topic) {
+  if (SPORTS_DISABLED) return null;
+  const tl = ' ' + String(topic).toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+  let best = null;
+  for (const lg of SPORTS_LEAGUES) {
+    const teams = await loadLeagueTeams(lg);
+    for (const t of teams) {
+      for (const a of t.aliases) {
+        if (a.length < 5) continue;                 // skip noisy short nicknames/abbr
+        if (tl.includes(' ' + a + ' ') && (!best || a.length > best.len)) best = { lg, team: t, len: a.length };
+      }
+    }
+  }
+  return best;
+}
+
+async function fetchTeamSchedule(lg, teamId) {
+  if (MOCK_MODE) {
+    return { last: 'San Francisco Giants 3 @ Los Angeles Dodgers 5 (Final)', lastDate: '2026-06-25',
+             next: 'San Diego Padres @ Los Angeles Dodgers', nextDate: '2026-06-28' };
+  }
+  try {
+    const r = await fetchWithRetry(ESPN + '/' + lg.sport + '/' + lg.league + '/teams/' + teamId + '/schedule', {}, { tries: 2, timeoutMs: 8000 });
+    const d = await r.json();
+    const nowMs = Date.now();
+    let last = null, next = null;
+    for (const ev of (d.events || [])) {
+      const comp = (ev.competitions || [])[0]; if (!comp) continue;
+      const cs = comp.competitors || [];
+      const home = cs.find(c => c.homeAway === 'home') || cs[0];
+      const away = cs.find(c => c.homeAway === 'away') || cs[1];
+      if (!home || !away) continue;
+      const completed = (((comp.status || ev.status || {}).type) || {}).completed;
+      const ms = Date.parse(ev.date);
+      const sc = c => (c.score && (c.score.displayValue || c.score.value)) != null ? ' ' + (c.score.displayValue || c.score.value) : '';
+      if (completed) {
+        const text = away.team.displayName + sc(away) + ' @ ' + home.team.displayName + sc(home) + ' (Final)';
+        if (!last || ms > last.ms) last = { ms, text, date: ev.date };
+      } else if (ms >= nowMs - 6 * 3600 * 1000) {
+        const text = away.team.displayName + ' @ ' + home.team.displayName;
+        if (!next || ms < next.ms) next = { ms, text, date: ev.date };
+      }
+    }
+    return { last: last && last.text, lastDate: last && last.date, next: next && next.text, nextDate: next && next.date };
+  } catch (e) { console.log('espn schedule error:', e.message); return null; }
+}
+
+async function sportsSourceForTopic(topic) {
+  const hit = await detectSportsTeam(topic);
+  if (!hit) return null;
+  const s = await fetchTeamSchedule(hit.lg, hit.team.id);
+  if (!s || (!s.last && !s.next)) return null;
+  let txt = 'Official ' + hit.lg.key.toUpperCase() + ' data for the ' + hit.team.name + '. ';
+  if (s.last) txt += 'Most recent result: ' + s.last + (s.lastDate ? ' (' + String(s.lastDate).slice(0, 10) + ')' : '') + '. ';
+  if (s.next) txt += 'Next game: ' + s.next + (s.nextDate ? ' (' + String(s.nextDate).slice(0, 10) + ')' : '') + '.';
+  return {
+    topic, publisher: 'ESPN', title: hit.team.name + ' — latest score & schedule',
+    url: ESPN + '/' + hit.lg.sport + '/' + hit.lg.league + '/teams/' + hit.team.id,
+    publishedAt: new Date().toISOString(), snippet: txt, fullText: txt, provider: 'espn_sports',
+  };
+}
+
 /* ---- one topic, routed ------------------------------------------------- */
+async function enrichArticle(url) {
+  // Best-effort: pull the real article text so the writer has concrete facts
+  // (scores, numbers, names) — RSS snippets alone are too thin. Dep-free,
+  // short timeout, always falls back to the snippet on any failure.
+  try {
+    const r = await fetchWithRetry(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MyCastBot/1.0; +https://mycast.app)' },
+    }, { tries: 1, timeoutMs: 7000 });
+    if (!r.ok) return '';
+    const html = await r.text();
+    const metaDesc = (html.match(/<meta[^>]+(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']+)["']/i) || [])[1] || '';
+    const body = html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&#?[a-z0-9]+;/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return ((metaDesc ? metaDesc + ' ' : '') + body).slice(0, 1500);
+  } catch (e) { return ''; }
+}
+
 async function retrieveForTopic(topic, windowKey) {
   const cacheKey = String(topic).toLowerCase() + '|' + windowKey;
   const cached = retrievalCache.get(cacheKey);
@@ -460,7 +592,11 @@ async function retrieveForTopic(topic, windowKey) {
     results = dedupeSources(results)
       .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
       .slice(0, 6); // per-topic cap (keeps one broad topic from flooding the brief)
+    // pull real article text for the top few so the writer has concrete facts
+    await Promise.all(results.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
   }
+  // sports topics: lead with exact scores/schedule rather than vague news
+  try { const sp = await sportsSourceForTopic(topic); if (sp) results = [sp, ...results]; } catch (e) {}
   retrievalCache.set(cacheKey, { at: Date.now(), data: results });
   return results;
 }
@@ -600,7 +736,10 @@ function sourcesBlock(sources) {
   for (const [topic, arr] of Object.entries(byTopic)) {
     out += '\n### SOURCES FOR TOPIC: ' + topic + '\n';
     arr.forEach((s, i) => {
-      out += (i + 1) + '. [' + s.publisher + '] ' + s.title + (s.snippet ? ' — ' + s.snippet : '') + '\n';
+      const body = (s.fullText && s.fullText.length > (s.snippet || '').length) ? s.fullText : (s.snippet || '');
+      const when = s.publishedAt ? ' (' + s.publishedAt + ')' : '';
+      out += (i + 1) + '. [' + s.publisher + ']' + when + ' ' + s.title + '\n';
+      if (body) out += '   ' + body + '\n';
     });
   }
   return out;
@@ -609,19 +748,23 @@ function sourcesBlock(sources) {
 async function writeBriefScript(topics, windowKey, sources, lengthMin) {
   const targetWords = Math.round(lengthMin * 150);
   const prompt =
-    'You are the narrator of a personal audio briefing. Write ONE spoken-word script of about ' +
-    targetWords + ' words.\n\n' +
-    'Cover the listener\'s topics IN THIS ORDER, giving each its own clear section:\n' +
+    'You are a sharp, experienced news reporter writing a spoken-word briefing for one listener. ' +
+    'Write ONE script of about ' + targetWords + ' words.\n\n' +
+    'Cover these topics IN THIS ORDER, each as its own clear section:\n' +
     topics.map((t, i) => (i + 1) + '. ' + t).join('\n') + '\n\n' +
-    'Rules:\n' +
-    '- Use ONLY the source material below. It is grouped by topic. For each topic, use ONLY the sources listed under that topic.\n' +
-    '- IGNORE any source that is not clearly about its topic (the news feed sometimes returns loosely-related items — skip those).\n' +
-    '- Do NOT invent facts, numbers, or quotes.\n' +
-    '- If a topic has no relevant sources, say in one short sentence that there were no notable updates for it, then move on.\n' +
-    '- OPEN with a brief one-line greeting that names the topics you\'ll cover. Do NOT open by diving straight into a single story.\n' +
-    '- Move through the topics in the order above; spend proportionally more time on the earlier topics.\n' +
-    '- Spoken aloud: warm, clear, natural transitions, no headers, no bullet points, no stage directions. End with a short sign-off.\n\n' +
-    'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours):\n' +
+    'HOW TO REPORT (this is the whole job):\n' +
+    '- Lead each topic with the single most important, most RECENT concrete development, then add the next most important. Inverted pyramid.\n' +
+    '- Be specific and factual. Pull the hard facts out of the sources: final scores, numbers, dollar amounts, names, dates, who did what, and what it means. ' +
+    'A line like "the Dodgers played" is worthless; "the Dodgers beat the Giants 5-3 last night, their fourth straight win" is the job. If the sources contain a number, a score, or a result, SAY IT.\n' +
+    '- Prefer the newest sources; if sources conflict, go with the most recent. Mention roughly when something happened ("last night," "Tuesday") when the sources show it.\n' +
+    '- Give context in a sentence: why it matters or what is next.\n\n' +
+    'HARD RULES:\n' +
+    '- Use ONLY the source material below, grouped by topic; for each topic use only that topic\'s sources.\n' +
+    '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
+    '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
+    '- If a topic genuinely has no relevant sources, say so in one short sentence and move on.\n\n' +
+    'STYLE: Open with a half-sentence intro naming the topics, then get straight to the news. Spoken aloud — warm, brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
+    'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours; each item may include the article text):\n' +
     sourcesBlock(sources);
   return callClaude(prompt, 8192);
 }
@@ -937,7 +1080,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.12', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.14', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1217,7 +1360,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.12 on port ' + PORT
+        console.log('MyCast v9.14 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -1229,7 +1372,7 @@ if (require.main === module) {
 // Exported for testing only.
 module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTopic, retrieveSources,
   tickSchedules, localParts, dueTimes, buildBriefEpisode, store,
-  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount, classifyTtsError };
+  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount, classifyTtsError, detectSportsTeam, sportsSourceForTopic };
 
 /* =========================================================================
    PRODUCTION NOTES (not code — read before selling)
