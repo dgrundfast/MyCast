@@ -1,6 +1,6 @@
 {
   "name": "mycast-backend",
-  "version": "9.8.0",
+  "version": "9.10.0",
   "description": "MyCast backend — Briefs + Deep Dives, fast-start streaming, real sources, durable storage, accounts + tiers, scheduled pre-gen, audio cache + resilience",
   "main": "index.js",
   "type": "commonjs",
