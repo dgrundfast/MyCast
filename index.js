@@ -613,6 +613,85 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin) {
   return callClaude(prompt, 8192);
 }
 
+/* =========================================================================
+   DEEP DIVE REFERENCES — real, citable grounding for Deep Dives.
+   Layered providers (graceful):
+     - Tavily (if TAVILY_API_KEY set): broad, credible, LLM-ready web sources.
+     - Wikipedia (keyless): always-on encyclopedic backbone.
+   Combined, deduped, capped. If Tavily isn't configured or fails, Wikipedia
+   carries it; if both fail, the episode still generates (no sources).
+   Optional env: TAVILY_API_KEY
+   ========================================================================= */
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
+
+async function retrieveWikipedia(topic) {
+  const refs = [];
+  const UA = { 'User-Agent': 'MyCast/1.0 (contact: support@mycast.app)' };
+  try {
+    const sr = await fetchWithRetry(
+      'https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=4&srsearch=' + encodeURIComponent(topic),
+      { headers: UA }, { tries: 2, timeoutMs: 8000 });
+    const sd = await sr.json();
+    const titles = ((sd.query && sd.query.search) || []).map(x => x.title);
+    for (const title of titles) {
+      try {
+        const pr = await fetchWithRetry(
+          'https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(title),
+          { headers: UA }, { tries: 2, timeoutMs: 8000 });
+        const pd = await pr.json();
+        if (pd && pd.extract) {
+          refs.push({
+            publisher: 'Wikipedia', title: pd.title || title,
+            url: (pd.content_urls && pd.content_urls.desktop && pd.content_urls.desktop.page)
+              || 'https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g, '_')),
+            snippet: String(pd.extract).slice(0, 600), provider: 'wikipedia',
+          });
+        }
+      } catch (e) { /* skip this page */ }
+    }
+  } catch (e) { console.log('wikipedia reference error:', e.message); }
+  return refs;
+}
+
+async function retrieveTavily(topic) {
+  if (!TAVILY_API_KEY) return [];
+  try {
+    const r = await fetchWithRetry('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: TAVILY_API_KEY, query: topic, search_depth: 'basic', max_results: 6 }),
+    }, { tries: 2, timeoutMs: 12000 });
+    if (!r.ok) return [];
+    const d = await r.json();
+    return (d.results || []).map(x => ({
+      publisher: hostnameOf(x.url) || 'Web', title: x.title, url: x.url,
+      snippet: String(x.content || '').slice(0, 600), provider: 'tavily',
+    }));
+  } catch (e) { console.log('tavily error:', e.message); return []; }
+}
+
+async function retrieveReferences(topic) {
+  if (MOCK_MODE) {
+    const out = [{
+      publisher: 'Wikipedia', title: topic + ' (overview)',
+      url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(String(topic).replace(/ /g, '_')),
+      snippet: 'Mock reference extract about ' + topic + '.', provider: 'wikipedia',
+    }];
+    if (TAVILY_API_KEY) out.unshift({
+      publisher: 'example.com', title: 'Web reference: ' + topic, url: 'https://example.com/' + encodeURIComponent(topic),
+      snippet: 'Mock web reference about ' + topic + '.', provider: 'tavily',
+    });
+    return out;
+  }
+  const [web, wiki] = await Promise.all([retrieveTavily(topic), retrieveWikipedia(topic)]);
+  return dedupeSources([...web, ...wiki]).slice(0, 8); // web sources lead, wiki backs them
+}
+
+function referencesBlock(refs) {
+  if (!refs.length) return '(No reference material was retrieved. Rely on well-established general knowledge and avoid stating specific facts, dates, names, or numbers you are not confident are correct.)';
+  return refs.map((r, i) => (i + 1) + '. [' + r.publisher + '] ' + r.title + ' — ' + (r.snippet || '')).join('\n');
+}
+
 async function writeDeepDivePlan(topic, depthKey) {
   const n = (DEPTH[depthKey] || DEPTH.conversational).episodes;
   if (MOCK_MODE) {
@@ -629,14 +708,17 @@ async function writeDeepDivePlan(topic, depthKey) {
   return titles.slice(0, n);
 }
 
-async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN) {
+async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, refs) {
   const targetWords = Math.round(lengthMin * 150);
   const prompt =
     'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
-    '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + '). ' +
-    'Conversational and clear, no headers or bullet points, written to be heard not read. ' +
-    'Briefly connect to the series arc, teach the core ideas with concrete examples, and end with a ' +
-    'one-line bridge to what comes next.';
+    '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
+    'Ground the episode in the REFERENCE MATERIAL below. You may add well-established general knowledge to ' +
+    'explain and connect ideas, but do NOT invent specific facts, dates, names, statistics, or quotes that ' +
+    'are not supported by the references or that you are not confident are correct.\n\n' +
+    'Conversational and clear, no headers or bullet points, written to be heard not read. Briefly connect to ' +
+    'the series arc, teach the core ideas with concrete examples, and end with a one-line bridge to what comes next.\n\n' +
+    'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
   return callClaude(prompt, 8192);
 }
 
@@ -814,7 +896,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.8', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.10', mock: MOCK_MODE, db: USE_DB }));
 
 app.get('/api/voices', (req, res) => {
   res.json({
@@ -933,13 +1015,17 @@ app.post('/api/deepdive', async (req, res) => {
 
   // generate episode 1 first (fast start), then the rest in the background
   (async () => {
+    const refs = await retrieveReferences(t);     // real, citable grounding for the whole series
+    series.sources = refs;
+    await store.updateSeries(series);
     for (let i = 0; i < series.episodes.length; i++) {
       const ref = series.episodes[i];
       const ep = await store.getEpisode(ref.id);
       ep.status = 'generating'; ref.status = 'generating';
+      ep.sources = refs;                          // show the references on each episode
       await store.updateSeries(series);
       try {
-        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length);
+        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length, refs);
         await generateEpisodeSegments(ep, script);
         ref.status = ep.status;
       } catch (e) {
@@ -1029,7 +1115,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.8 on port ' + PORT
+        console.log('MyCast v9.10 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
