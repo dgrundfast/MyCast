@@ -770,7 +770,7 @@ function sourcesBlock(sources) {
 }
 
 async function writeBriefScript(topics, windowKey, sources, lengthMin) {
-  const targetWords = Math.round(lengthMin * 150);
+  const targetWords = Math.round(lengthMin * 160);
   const prompt =
     'You are a sharp, experienced news reporter writing a spoken-word briefing for one listener. ' +
     'Write ONE script of about ' + targetWords + ' words.\n\n' +
@@ -889,7 +889,7 @@ async function writeDeepDivePlan(topic, depthKey) {
 }
 
 async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, refs) {
-  const targetWords = Math.round(lengthMin * 150);
+  const targetWords = Math.round(lengthMin * 160);
   const prompt =
     'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
     '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
@@ -1213,48 +1213,6 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
   const applied = await setUserTier(userId, tier);
   console.log('revenuecat ' + type + ' -> ' + userId + ' tier=' + tier + (applied ? '' : ' (user not found)'));
   res.json({ ok: true, type, userId, tier, applied });
-});
-
-/* ----- billing/refresh (called by app on open to sync tier from RevenueCat) */
-/* The app calls this after a purchase or on launch to ensure the backend tier
-   matches what RevenueCat shows. Looks up the subscriber server-side using the
-   RevenueCat REST API and updates the user's tier in the database.
-   Requires REVENUECAT_SECRET_KEY env var (your RevenueCat secret/private key). */
-const REVENUECAT_SECRET_KEY = process.env.REVENUECAT_SECRET_KEY || '';
-app.post('/api/billing/refresh', async (req, res) => {
-  const user = await getReqUser(req);
-  const { appUserId } = req.body || {};
-  const rcUserId = appUserId || user.id;
-  if (!REVENUECAT_SECRET_KEY) {
-    // No RC key configured — return current tier without updating
-    return res.json({ userId: user.id, tier: user.tier, synced: false, note: 'REVENUECAT_SECRET_KEY not set' });
-  }
-  try {
-    const rcRes = await fetchWithRetry(
-      'https://api.revenuecat.com/v1/subscribers/' + encodeURIComponent(rcUserId),
-      { headers: { 'Authorization': 'Bearer ' + REVENUECAT_SECRET_KEY, 'Content-Type': 'application/json' } },
-      { tries: 2, timeoutMs: 10000 }
-    );
-    if (!rcRes.ok) {
-      console.log('RC refresh failed:', rcRes.status, rcUserId);
-      return res.json({ userId: user.id, tier: user.tier, synced: false });
-    }
-    const rcData = await rcRes.json();
-    const entitlements = (rcData.subscriber || {}).entitlements || {};
-    const nowIso = new Date().toISOString();
-    let tier = 'free';
-    if (entitlements['pro'] && entitlements['pro'].expires_date > nowIso) tier = 'pro';
-    else if (entitlements['plus'] && entitlements['plus'].expires_date > nowIso) tier = 'plus';
-    if (tier !== user.tier) {
-      user.tier = tier;
-      await store.updateUser(user);
-      console.log('billing/refresh: ' + rcUserId + ' -> ' + tier);
-    }
-    res.json({ userId: user.id, tier, synced: true });
-  } catch (e) {
-    console.error('billing/refresh error:', e.message);
-    res.json({ userId: user.id, tier: user.tier, synced: false, error: e.message });
-  }
 });
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
