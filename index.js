@@ -416,17 +416,28 @@ async function fromGoogleNews(topic, cutoff) {
       'https://news.google.com/rss/search?q=' + encodeURIComponent(topic) + '&hl=en-US&gl=US&ceid=US:en'
     );
     const out = [];
+    // Use a fallback cutoff of 7 days if the strict window returns nothing
+    const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
     for (const item of feed.items || []) {
       const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-      if (isNaN(ts) || ts < cutoff) continue;
+      // Accept article if within strict window OR within 7-day fallback
+      if (isNaN(ts)) continue;
+      if (ts < fallbackCutoff) continue; // older than 7 days, skip entirely
       const parts = (item.title || '').split(' - '); // "Headline - Publisher"
       const publisher = parts.length > 1 ? parts.pop() : (item.creator || 'News');
       out.push({
         topic, publisher, title: parts.join(' - ') || item.title, url: item.link,
         publishedAt: new Date(ts).toISOString(),
         snippet: (item.contentSnippet || '').slice(0, 280), provider: 'google_news',
+        withinWindow: ts >= cutoff, // flag for sorting — recent items lead
       });
     }
+    // Sort: articles within the strict window first, then fallback articles
+    out.sort((a, b) => {
+      if (a.withinWindow && !b.withinWindow) return -1;
+      if (!a.withinWindow && b.withinWindow) return 1;
+      return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+    });
     return out;
   } catch (e) { console.log('google_news error:', e.message); return []; }
 }
