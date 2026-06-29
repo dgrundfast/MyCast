@@ -319,6 +319,9 @@ async function getReqUser(req) {
   }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
+  // Always reset anon count so unauthenticated requests (dev testing) never hit a wall
+  anon.gen_count = 0;
+  anon.tier = 'plus'; // Give anon a higher limit for testing
   return anon;
 }
 
