@@ -1427,7 +1427,17 @@ app.post('/api/schedule', async (req, res) => {
 });
 app.get('/api/schedule', async (req, res) => {
   const user = await getReqUser(req);
-  res.json({ schedules: await store.listSchedules(user.id) });
+  const raw = await store.listSchedules(user.id);
+  const schedules = raw.map(sc => ({
+    id: sc.id,
+    config: sc.config || {},
+    times: sc.times || ['07:00'],
+    timezone: sc.timezone || 'America/New_York',
+    lastEpisodeId: sc.lastEpisodeId || null,
+    lastGeneratedDate: sc.lastGeneratedDate || null,
+    createdAt: sc.createdAt,
+  }));
+  res.json({ schedules });
 });
 app.delete('/api/schedule/:id', async (req, res) => {
   const user = await getReqUser(req);
