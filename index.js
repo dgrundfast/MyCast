@@ -259,6 +259,8 @@ const DEPTH = {
 const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
 const PLUS_LIMIT = parseInt(process.env.PLUS_LIMIT || '30', 10);
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+// Developer accounts — always Pro, never hit usage limits
+const DEVELOPER_IDS = (process.env.DEVELOPER_IDS || 'usr_13f0d135e6c2').split(',').map(s => s.trim()).filter(Boolean);
 const TIER_RANK = { free: 0, plus: 1, pro: 2 };
 
 // ⚠️ PRODUCT DECISIONS (flip these freely):
@@ -304,7 +306,17 @@ function voiceAllowed(user, voiceId) {
 async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
-  if (m) { const u = await store.getUserByToken(m[1].trim()); if (u) return u; }
+  if (m) {
+    const u = await store.getUserByToken(m[1].trim());
+    if (u) {
+      // Developer accounts always get Pro tier and unlimited generations
+      if (DEVELOPER_IDS.includes(u.id)) {
+        u.tier = 'pro';
+        u.gen_count = 0;
+      }
+      return u;
+    }
+  }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
   return anon;
