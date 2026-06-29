@@ -850,6 +850,46 @@ async function retrieveTavily(topic) {
   } catch (e) { console.log('tavily error:', e.message); return []; }
 }
 
+
+async function retrieveSemanticScholar(topic, expert) {
+  expert = expert || false;
+  var fields = 'title,abstract,year,authors,url,externalIds,venue,citationCount';
+  var url = 'https://api.semanticscholar.org/graph/v1/paper/search?query=' +
+    encodeURIComponent(topic) + '&limit=8&fields=' + fields;
+  try {
+    var ctrl = new AbortController();
+    var t = setTimeout(function() { ctrl.abort(); }, 8000);
+    var res = await fetch(url, {
+      headers: { 'User-Agent': 'MyCast/1.0', 'Accept': 'application/json' },
+      signal: ctrl.signal,
+    });
+    clearTimeout(t);
+    if (!res.ok) return [];
+    var data = await res.json();
+    var papers = (data && data.data ? data.data : []).filter(function(p) { return p && p.title; });
+    papers.sort(function(a, b) {
+      return expert ? (b.year || 0) - (a.year || 0) : (b.citationCount || 0) - (a.citationCount || 0);
+    });
+    return papers.slice(0, 5).map(function(p) {
+      var authorNames = (p.authors || []).map(function(a) { return a.name; }).filter(Boolean);
+      var authors = authorNames[0] || null;
+      if (authorNames.length === 2) authors = authorNames.join(' & ');
+      else if (authorNames.length > 2) authors = authorNames[0] + ' et al.';
+      var abstract = p.abstract ? p.abstract.slice(0, 500).trimEnd() + '...' : '';
+      return {
+        publisher: p.venue || 'Semantic Scholar',
+        title: p.title,
+        url: p.url || (p.externalIds && p.externalIds.DOI ? 'https://doi.org/' + p.externalIds.DOI : null),
+        snippet: (authors && p.year ? '(' + authors + ', ' + p.year + ') ' : '') + abstract,
+        provider: 'semantic_scholar',
+      };
+    });
+  } catch (e) {
+    console.warn('[research] Semantic Scholar failed:', e.message);
+    return [];
+  }
+}
+
 async function retrieveReferences(topic) {
   if (MOCK_MODE) {
     const out = [{
@@ -863,8 +903,8 @@ async function retrieveReferences(topic) {
     });
     return out;
   }
-  const [web, wiki] = await Promise.all([retrieveTavily(topic), retrieveWikipedia(topic)]);
-  return dedupeSources([...web, ...wiki]).slice(0, 8); // web sources lead, wiki backs them
+  const [web, wiki, scholar] = await Promise.all([retrieveTavily(topic), retrieveWikipedia(topic), retrieveSemanticScholar(topic)]);
+  return dedupeSources([...scholar, ...web, ...wiki]).slice(0, 10); // scholar + web sources lead, wiki backs them
 }
 
 function referencesBlock(refs) {
