@@ -916,6 +916,84 @@ async function retrieveSemanticScholar(topic, expert) {
   }
 }
 
+
+/* ---- PubMed (NIH, peer-reviewed medical & life science, no key needed) --- */
+async function retrievePubMed(topic) {
+  try {
+    var searchUrl = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=' +
+      encodeURIComponent(topic) + '&retmax=5&retmode=json&sort=relevance';
+    var ctrl = new AbortController();
+    var t = setTimeout(function() { ctrl.abort(); }, 8000);
+    var searchRes = await fetch(searchUrl, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!searchRes.ok) return [];
+    var searchData = await searchRes.json();
+    var ids = (searchData.esearchresult && searchData.esearchresult.idlist) ? searchData.esearchresult.idlist : [];
+    if (!ids.length) return [];
+    var summaryUrl = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=' +
+      ids.join(',') + '&retmode=json';
+    var ctrl2 = new AbortController();
+    var t2 = setTimeout(function() { ctrl2.abort(); }, 8000);
+    var summaryRes = await fetch(summaryUrl, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl2.signal });
+    clearTimeout(t2);
+    if (!summaryRes.ok) return [];
+    var summaryData = await summaryRes.json();
+    var result = summaryData.result || {};
+    return ids.map(function(pmid) {
+      var art = result[pmid];
+      if (!art || !art.title) return null;
+      var authors = art.authors && art.authors.length ? art.authors[0].name + (art.authors.length > 1 ? ' et al.' : '') : null;
+      return {
+        publisher: art.source || 'PubMed',
+        title: art.title,
+        url: 'https://pubmed.ncbi.nlm.nih.gov/' + pmid + '/',
+        snippet: (authors ? '(' + authors + (art.pubdate ? ', ' + art.pubdate.slice(0,4) : '') + ') ' : '') + 'Published in ' + (art.source || 'PubMed') + '.',
+        provider: 'pubmed',
+      };
+    }).filter(Boolean);
+  } catch (e) {
+    console.warn('[research] PubMed failed:', e.message);
+    return [];
+  }
+}
+
+/* ---- arXiv (cutting-edge research, CS/math/physics/economics, no key) ---- */
+async function retrieveArXiv(topic) {
+  try {
+    var url = 'https://export.arxiv.org/api/query?search_query=all:' +
+      encodeURIComponent(topic) + '&start=0&max_results=5&sortBy=relevance';
+    var ctrl = new AbortController();
+    var t = setTimeout(function() { ctrl.abort(); }, 8000);
+    var res = await fetch(url, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl.signal });
+    clearTimeout(t);
+    if (!res.ok) return [];
+    var text = await res.text();
+    var entries = text.match(/<entry>([\s\S]*?)<\/entry>/g) || [];
+    return entries.slice(0, 5).map(function(entry) {
+      var titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
+      var summaryMatch = entry.match(/<summary>([\s\S]*?)<\/summary>/);
+      var linkMatch = entry.match(/href="(https:\/\/arxiv\.org\/abs\/[^"]+)"/);
+      var authorMatch = entry.match(/<name>([\s\S]*?)<\/name>/);
+      var yearMatch = entry.match(/<published>(\d{4})/);
+      if (!titleMatch) return null;
+      var title = titleMatch[1].trim().replace(/\s+/g, ' ');
+      var summary = summaryMatch ? summaryMatch[1].trim().replace(/\s+/g, ' ').slice(0, 400) + '...' : '';
+      var author = authorMatch ? authorMatch[1].trim() : null;
+      var year = yearMatch ? yearMatch[1] : null;
+      return {
+        publisher: 'arXiv',
+        title: title,
+        url: linkMatch ? linkMatch[1] : null,
+        snippet: (author && year ? '(' + author + ', ' + year + ') ' : '') + summary,
+        provider: 'arxiv',
+      };
+    }).filter(Boolean);
+  } catch (e) {
+    console.warn('[research] arXiv failed:', e.message);
+    return [];
+  }
+}
+
 async function retrieveReferences(topic) {
   if (MOCK_MODE) {
     const out = [{
@@ -929,8 +1007,11 @@ async function retrieveReferences(topic) {
     });
     return out;
   }
-  const [web, wiki, scholar] = await Promise.all([retrieveTavily(topic), retrieveWikipedia(topic), retrieveSemanticScholar(topic)]);
-  return dedupeSources([...scholar, ...web, ...wiki]).slice(0, 10); // scholar + web sources lead, wiki backs them
+  const [web, wiki, scholar, pubmed, arxiv] = await Promise.all([
+    retrieveTavily(topic), retrieveWikipedia(topic), retrieveSemanticScholar(topic),
+    retrievePubMed(topic), retrieveArXiv(topic)
+  ]);
+  return dedupeSources([...scholar, ...pubmed, ...arxiv, ...web, ...wiki]).slice(0, 15); // academic sources lead
 }
 
 function referencesBlock(refs) {
