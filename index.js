@@ -407,6 +407,41 @@ function dedupeSources(items) {
 
 // short cache so we don't hit news APIs on every single request
 const retrievalCache = new Map(); // "topic|window" -> { at, data }
+
+/* ---- Rundown combo popularity tracking + 12h pre-generation cache -------- */
+const comboPopularity = new Map(); // "channelIds|lengthMin" -> request count
+const popularComboCache = new Map(); // "channelIds|lengthMin" -> { at, episode }
+const POPULAR_CACHE_TTL_MS = 6 * 3600 * 1000; // 6 hours — keeps cached news fresh
+
+function comboKey(channels, lengthMin) {
+  return (channels || []).slice().sort().join(',') + '|' + lengthMin;
+}
+
+function trackComboPopularity(channels, topics, lengthMin) {
+  // Only track shared, topic-free combos — personalized requests (with custom
+  // topics) are unique per user and not worth pre-caching.
+  if (topics && topics.length) return;
+  if (!channels || !channels.length) return;
+  const key = comboKey(channels, lengthMin);
+  comboPopularity.set(key, (comboPopularity.get(key) || 0) + 1);
+}
+
+function getPopularCombos(limit) {
+  return Array.from(comboPopularity.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit || 15)
+    .map(([key, count]) => {
+      const [chanStr, lengthStr] = key.split('|');
+      return { channels: chanStr.split(',').filter(Boolean), lengthMin: parseInt(lengthStr, 10), count };
+    });
+}
+
+function getCachedPopularEpisode(channels, lengthMin) {
+  const key = comboKey(channels, lengthMin);
+  const cached = popularComboCache.get(key);
+  if (cached && Date.now() - cached.at < POPULAR_CACHE_TTL_MS) return cached.episode;
+  return null;
+}
 const RETRIEVAL_TTL_MS = 15 * 60 * 1000;
 
 /* ---- providers (each returns [] on any failure; never throws) ---------- */
@@ -1187,6 +1222,28 @@ async function buildBriefEpisode(user, cfg, opts) {
   const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
   const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
+
+  // Track popularity for shared, topic-free combos (used by the 12h pre-cache job)
+  trackComboPopularity(cleanChannels, cleanTopics, lengthMin);
+
+  // Serve from the 12h pre-generated cache if this exact shared combo was
+  // already built recently — instant response instead of ~60s live generation.
+  if (!cleanTopics.length && cleanChannels.length) {
+    const cachedEp = getCachedPopularEpisode(cleanChannels, lengthMin);
+    if (cachedEp) {
+      console.log('popular combo cache HIT:', comboKey(cleanChannels, lengthMin));
+      // Clone the cached episode as a fresh library entry for this user
+      const epId = id('ep');
+      const clone = Object.assign({}, cachedEp, {
+        id: epId, userId: user.id, status: cachedEp.status,
+        createdAt: now(),
+      });
+      await store.saveEpisode(clone);
+      await store.addToLibrary({ type: 'brief', id: epId, title: clone.title, createdAt: clone.createdAt, userId: user.id });
+      return clone;
+    }
+  }
+
   const sectionLabels = [...cleanChannels.map(c => CHANNELS[c].label), ...cleanTopics];
   const epId = id('ep');
   const ep = {
@@ -1203,6 +1260,11 @@ async function buildBriefEpisode(user, cfg, opts) {
       const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin);
       await generateEpisodeSegments(ep, script);
       await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
+      // Populate the popular-combo cache for shared, topic-free combos so the
+      // next user requesting the same combo gets an instant cached result.
+      if (!cleanTopics.length && cleanChannels.length && ep.status === 'ready') {
+        popularComboCache.set(comboKey(cleanChannels, lengthMin), { at: Date.now(), episode: ep });
+      }
     } catch (e) {
       ep.status = 'failed'; ep.error = e.message;
       await store.updateEpisode(ep);
@@ -1603,6 +1665,31 @@ app.get(/^(?!\/api|\/audio).*$/, (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+/* ---- 6-hour pre-generation job for popular Rundown combos ---------------- */
+const PRE_GEN_INTERVAL_MS = 6 * 3600 * 1000; // every 6 hours — keeps news fresh
+const PRE_GEN_TOP_N = 15; // pre-generate the top N most-requested combos
+
+async function preGeneratePopularCombos() {
+  const combos = getPopularCombos(PRE_GEN_TOP_N);
+  if (!combos.length) { console.log('pre-gen: no popular combos tracked yet'); return; }
+  console.log('pre-gen: warming cache for', combos.length, 'popular combos');
+  // Use the developer/system user so these don't count against any real
+  // user's monthly generation limit.
+  let sysUser = await store.getUser('system');
+  if (!sysUser) sysUser = await store.createUser({ id: 'system', token: 'system', tier: 'pro', gen_count: 0, period_start: periodKey() });
+  for (const combo of combos) {
+    try {
+      // Always regenerate on each pre-gen cycle so cached content reflects
+      // the latest news rather than serving a stale 6-hour-old cache hit.
+      console.log('pre-gen: generating', comboKey(combo.channels, combo.lengthMin), '(', combo.count, 'requests)');
+      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'josh' }, { await: true });
+    } catch (e) {
+      console.log('pre-gen failed for combo', comboKey(combo.channels, combo.lengthMin), ':', e.message);
+    }
+  }
+  console.log('pre-gen: cycle complete');
+}
+
 if (require.main === module) {
   initDb()
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
@@ -1614,6 +1701,10 @@ if (require.main === module) {
       // scheduler: tick every minute, plus once shortly after boot
       setInterval(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 60 * 1000);
       setTimeout(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 5000);
+      // popular-combo pre-generation: every 6 hours, plus once 2 min after boot
+      // (delayed start so there's some real request data to base popularity on)
+      setInterval(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), PRE_GEN_INTERVAL_MS);
+      setTimeout(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), 2 * 60 * 1000);
     });
 }
 
