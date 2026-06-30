@@ -1400,6 +1400,42 @@ app.get('/api/me', async (req, res) => {
 });
 
 // Billing seam: RevenueCat/Stripe (or you, manually) set a user's tier here.
+/* ----- billing/refresh — app calls this on launch to sync Pro status ------- */
+app.post('/api/billing/refresh', async (req, res) => {
+  const user = await getReqUser(req);
+  const { appUserId } = req.body || {};
+  const rcUserId = appUserId || user.id;
+  const RC_SECRET = process.env.REVENUECAT_SECRET_KEY || '';
+  if (!RC_SECRET) {
+    return res.json({ userId: user.id, tier: user.tier, synced: false, note: 'REVENUECAT_SECRET_KEY not configured' });
+  }
+  try {
+    const rcRes = await fetchWithRetry(
+      'https://api.revenuecat.com/v1/subscribers/' + encodeURIComponent(rcUserId),
+      { headers: { 'Authorization': 'Bearer ' + RC_SECRET, 'Content-Type': 'application/json' } },
+      { tries: 2, timeoutMs: 10000 }
+    );
+    if (!rcRes.ok) {
+      console.log('billing/refresh: RC lookup failed', rcRes.status, rcUserId);
+      return res.json({ userId: user.id, tier: user.tier, synced: false });
+    }
+    const rcData = await rcRes.json();
+    const entitlements = (rcData.subscriber || {}).entitlements || {};
+    const nowIso = new Date().toISOString();
+    let tier = 'free';
+    if (entitlements['pro'] && entitlements['pro'].expires_date > nowIso) tier = 'pro';
+    else if (entitlements['plus'] && entitlements['plus'].expires_date > nowIso) tier = 'plus';
+    if (tier !== user.tier) {
+      await setUserTier(user.id, tier);
+      console.log('billing/refresh: ' + rcUserId + ' -> ' + tier);
+    }
+    res.json({ userId: user.id, tier, synced: true });
+  } catch (e) {
+    console.error('billing/refresh error:', e.message);
+    res.json({ userId: user.id, tier: user.tier, synced: false, error: e.message });
+  }
+});
+
 app.post('/api/admin/set-tier', async (req, res) => {
   if (!ADMIN_TOKEN || req.headers['x-admin-token'] !== ADMIN_TOKEN)
     return res.status(403).json({ error: 'forbidden' });
