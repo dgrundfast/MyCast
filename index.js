@@ -798,22 +798,31 @@ function sourcesBlock(sources) {
 async function writeBriefScript(topics, windowKey, sources, lengthMin) {
   const targetWords = Math.round(lengthMin * 160);
   const prompt =
-    'You are a sharp, experienced news reporter writing a spoken-word briefing for one listener. ' +
+    'PERSONA: You are "The Wire Editor" — a senior news editor with 20 years in broadcast journalism. ' +
+    'You have synthesized thousands of breaking stories into clear, trustworthy briefings. You write the way ' +
+    'the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
     'Write ONE script of about ' + targetWords + ' words.\n\n' +
     'Cover these topics IN THIS ORDER, each as its own clear section:\n' +
     topics.map((t, i) => (i + 1) + '. ' + t).join('\n') + '\n\n' +
     'HOW TO REPORT (this is the whole job):\n' +
-    '- Lead each topic with the single most important, most RECENT concrete development, then add the next most important. Inverted pyramid.\n' +
+    '- INVERTED PYRAMID: Lead each topic with the single most important, most RECENT concrete development, then add supporting detail in descending importance. The listener should get the headline even if they only catch the first sentence.\n' +
+    '- NAMED ATTRIBUTION MID-STORY: Weave the source into the sentence as you report it — "Reuters reports the central bank raised rates" not a citation tacked on at the end. This builds trust as the listener hears it, not after.\n' +
     '- Be specific and factual. Pull the hard facts out of the sources: final scores, numbers, dollar amounts, names, dates, who did what, and what it means. ' +
     'A line like "the Dodgers played" is worthless; "the Dodgers beat the Giants 5-3 last night, their fourth straight win" is the job. If the sources contain a number, a score, or a result, SAY IT.\n' +
+    '- CONNECT THE DOTS: If two topics relate to the same underlying event or trend, draw that connection explicitly rather than treating each topic as an isolated silo.\n' +
     '- Prefer the newest sources; if sources conflict, go with the most recent. Mention roughly when something happened ("last night," "Tuesday") when the sources show it.\n' +
-    '- Give context in a sentence: why it matters or what is next.\n\n' +
+    '- WHY IT MATTERS: Close each story with one sentence connecting it to listener relevance or what happens next — the way a good anchor frames stakes, not just facts.\n\n' +
     'HARD RULES:\n' +
     '- Use ONLY the source material below, grouped by topic; for each topic use only that topic\'s sources.\n' +
     '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
     '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
     '- If a topic genuinely has no relevant sources, say so in one short sentence and move on.\n\n' +
-    'STYLE: Open with a half-sentence intro naming the topics, then get straight to the news. Spoken aloud — warm, brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
+    'STYLE & VOICE:\n' +
+    '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
+    '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
+    '- Ban stale transitions: never start consecutive stories with "In other news," "Meanwhile," or "Moving on." Vary the connective tissue between stories.\n' +
+    '- Keep sentences SHORT for natural text-to-speech delivery — one clear idea per sentence reads far better aloud than long compound clauses.\n' +
+    '- Spoken aloud — brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
     'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours; each item may include the article text):\n' +
     sourcesBlock(sources);
   return callClaude(prompt, 8192);
@@ -1025,8 +1034,13 @@ async function writeDeepDivePlan(topic, depthKey) {
     return Array.from({ length: n }, (_, i) => 'Part ' + (i + 1) + ': ' + topic);
   }
   const prompt =
+    'PERSONA: You are "The Curriculum Architect" — an expert instructional designer who has built learning ' +
+    'paths for top universities and professional training programs. You understand how people actually learn: ' +
+    'progressively, with each concept scaffolded on the last, never assuming prior knowledge the learner hasn\'t earned yet.\n\n' +
     'Plan a ' + n + '-episode audio mini-series that takes a listener from zero to "' +
     (DEPTH[depthKey] || DEPTH.conversational).label + '" knowledge of: ' + topic + '.\n' +
+    'PEDAGOGICAL STRUCTURE: Order episodes so foundational concepts come first and advanced applications come last. ' +
+    'Each episode title should signal what specific capability or understanding the listener gains — not just a topic label.\n' +
     'Return ONLY the ' + n + ' episode titles, one per line, no numbering, no extra text. ' +
     'Order them so each builds on the last.';
   const text = await callClaude(prompt, 1024);
@@ -1035,16 +1049,29 @@ async function writeDeepDivePlan(topic, depthKey) {
   return titles.slice(0, n);
 }
 
-async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, refs) {
+async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, refs, priorEpisodeTitles) {
   const targetWords = Math.round(lengthMin * 160);
+  const priorContext = (priorEpisodeTitles && priorEpisodeTitles.length)
+    ? 'Episodes already covered in this series (you may reference and build on these, do not re-teach them): ' + priorEpisodeTitles.join('; ') + '.\n\n'
+    : '';
   const prompt =
+    'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
+    'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
     'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
     '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
+    priorContext +
+    'TEACHING METHOD (this is the whole job):\n' +
+    '- PREREQUISITE AWARENESS: Build directly on what prior episodes established. Reference earlier concepts by name when relevant, the way a good course reinforces earlier material.\n' +
+    '- DEFINE JARGON ON FIRST USE: You are an expert, but the listener may not be. The first time you introduce a technical term, define it in one clear phrase before moving on.\n' +
+    '- CONCRETE ANALOGIES: When explaining findings from the reference material, translate them into a vivid mental model or comparison the listener can hold onto — not just a restatement of the study.\n' +
+    '- CITE REAL RESEARCH BY NAME: When the reference material includes a specific study, researcher, or finding, name it directly ("Stanford researcher BJ Fogg found...") rather than vague phrasing like "studies show."\n' +
+    '- SYNTHESIS CLOSE: End the episode with a question or challenge the listener should be able to answer if they absorbed the material — reinforcing active learning, not passive listening.\n\n' +
     'Ground the episode in the REFERENCE MATERIAL below. You may add well-established general knowledge to ' +
     'explain and connect ideas, but do NOT invent specific facts, dates, names, statistics, or quotes that ' +
     'are not supported by the references or that you are not confident are correct.\n\n' +
-    'Conversational and clear, no headers or bullet points, written to be heard not read. Briefly connect to ' +
-    'the series arc, teach the core ideas with concrete examples, and end with a one-line bridge to what comes next.\n\n' +
+    'STYLE: Conversational and clear, no headers or bullet points, written to be heard not read. Keep sentences ' +
+    'short for natural text-to-speech delivery. Briefly connect to the series arc, teach the core ideas with ' +
+    'concrete examples, and end with a one-line bridge to what comes next.\n\n' +
     'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
   return callClaude(prompt, 8192);
 }
@@ -1475,7 +1502,8 @@ app.post('/api/deepdive', async (req, res) => {
       ep.sources = refs;                          // show the references on each episode
       await store.updateSeries(series);
       try {
-        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length, refs);
+        const priorTitles = series.episodes.slice(0, i).map(e => e.title);
+        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length, refs, priorTitles);
         await generateEpisodeSegments(ep, script);
         ref.status = ep.status;
       } catch (e) {
