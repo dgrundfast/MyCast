@@ -307,8 +307,7 @@ async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (m) {
-    const tok = m[1].trim();
-    const u = await store.getUserByToken(tok);
+    const u = await store.getUserByToken(m[1].trim());
     if (u) {
       // Developer accounts always get Pro tier and unlimited generations
       if (DEVELOPER_IDS.includes(u.id)) {
@@ -317,24 +316,6 @@ async function getReqUser(req) {
       }
       return u;
     }
-    // Recovery path: the request carries a real Bearer token, but no account
-    // matches it (e.g. the account was deleted or the DB was rebuilt, leaving
-    // the app holding an orphaned login it cannot clear from the keychain).
-    // Bind that token to a persistent Pro developer account so the wedged app
-    // resolves correctly instead of silently falling back to the anon guest.
-    const devId = DEVELOPER_IDS[0] || 'usr_13f0d135e6c2';
-    let dev = await store.getUser(devId);
-    if (!dev) {
-      dev = await store.createUser({ id: devId, token: tok, tier: 'pro', gen_count: 0, period_start: periodKey() });
-    } else if (dev.token !== tok) {
-      dev.token = tok;
-      dev.tier = 'pro';
-      dev.gen_count = 0;
-      await store.updateUser(dev);
-    }
-    dev.tier = 'pro';
-    dev.gen_count = 0;
-    return dev;
   }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
@@ -1074,7 +1055,23 @@ async function retrieveReferences(topic) {
     retrieveTavily(topic), retrieveWikipedia(topic), retrieveSemanticScholar(topic),
     retrievePubMed(topic), retrieveArXiv(topic)
   ]);
-  return dedupeSources([...scholar, ...pubmed, ...arxiv, ...web, ...wiki]).slice(0, 15); // academic sources lead
+
+  // Topic-aware source weighting: only include academic sources when they're
+  // likely to be relevant. Humanities, history, culture, food, and general
+  // topics don't benefit from arXiv physics papers or PubMed clinical studies.
+  const isScientific = /\b(science|biology|chemistry|physics|medicine|health|psychology|neuroscience|genetics|climate|AI|machine learning|algorithm|engineering|math|economics|finance|technology|drug|disease|cancer|vaccine|nutrition|exercise|brain|study|research|data)\b/i.test(topic);
+  const isMedical = /\b(health|medicine|disease|cancer|drug|therapy|vaccine|nutrition|diet|exercise|mental|brain|neuroscience|psychology|clinical|patient|symptom|treatment)\b/i.test(topic);
+  const isTech = /\b(AI|machine learning|algorithm|software|computer|coding|programming|data|neural|deep learning|robotics|cryptocurrency|blockchain)\b/i.test(topic);
+
+  // Build source list based on topic type
+  const sources = [];
+  sources.push(...scholar.slice(0, isScientific ? 5 : 2)); // Semantic Scholar always useful, more for scientific topics
+  if (isMedical) sources.push(...pubmed.slice(0, 4));       // PubMed only for medical/health topics
+  if (isTech || isScientific) sources.push(...arxiv.slice(0, 3)); // arXiv only for tech/science topics
+  sources.push(...web);
+  sources.push(...wiki.slice(0, 2));
+
+  return dedupeSources(sources).slice(0, 15);
 }
 
 function referencesBlock(refs) {
