@@ -1105,6 +1105,47 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
   const priorContext = (priorEpisodeTitles && priorEpisodeTitles.length)
     ? 'Episodes already covered in this series (you may reference and build on these, do not re-teach them): ' + priorEpisodeTitles.join('; ') + '.\n\n'
     : '';
+
+  // For long episodes (>= 15 min = 2400+ words), generate in two halves to
+  // avoid LLM timeouts. Each half is ~half the target words and covers a
+  // distinct portion of the episode arc. The halves are concatenated before
+  // segmentation so the player sees one continuous episode.
+  if (lengthMin >= 15) {
+    const halfWords = Math.round(targetWords / 2);
+    const basePrompt = 'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
+      'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
+      'You are writing episode "' + episodeTitle + '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
+      priorContext +
+      'TEACHING METHOD:\n' +
+      '- PREREQUISITE AWARENESS: Build directly on what prior episodes established.\n' +
+      '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you use them.\n' +
+      '- CONCRETE ANALOGIES: Translate research findings into vivid mental models.\n' +
+      '- CITE REAL RESEARCH BY NAME: Name specific researchers and studies from the reference material.\n\n' +
+      'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
+      'statistics, or quotes not supported by the references.\n\n' +
+      'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences.\n\n' +
+      'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
+
+    const part1Prompt = basePrompt + '\n\nWrite ONLY the FIRST HALF of this episode (~' + halfWords + ' words). ' +
+      'Cover the foundational concepts and opening examples. End mid-thought (do not conclude) — ' +
+      'the second half will complete the episode. Return ONLY the spoken script text, nothing else.';
+
+    const part2Prompt = basePrompt + '\n\nWrite ONLY the SECOND HALF of this episode (~' + halfWords + ' words). ' +
+      'Continue from where the first half would naturally leave off — build on the foundational concepts, ' +
+      'deepen with examples, and close with a synthesis question the listener should be able to answer. ' +
+      'Return ONLY the spoken script text, nothing else.';
+
+    const [part1, part2] = await Promise.all([
+      callClaude(part1Prompt, 4096),
+      callClaude(part2Prompt, 4096),
+    ]);
+
+    // Sanitize: remove raw control characters that break JSON parsing
+    const combined = (part1 + ' ' + part2).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
+    return combined;
+  }
+
+  // Short episodes (< 15 min) — single call as before
   const prompt =
     'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
     'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
@@ -1112,19 +1153,19 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
     '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
     priorContext +
     'TEACHING METHOD (this is the whole job):\n' +
-    '- PREREQUISITE AWARENESS: Build directly on what prior episodes established. Reference earlier concepts by name when relevant, the way a good course reinforces earlier material.\n' +
-    '- DEFINE JARGON ON FIRST USE: You are an expert, but the listener may not be. The first time you introduce a technical term, define it in one clear phrase before moving on.\n' +
-    '- CONCRETE ANALOGIES: When explaining findings from the reference material, translate them into a vivid mental model or comparison the listener can hold onto — not just a restatement of the study.\n' +
-    '- CITE REAL RESEARCH BY NAME: When the reference material includes a specific study, researcher, or finding, name it directly ("Stanford researcher BJ Fogg found...") rather than vague phrasing like "studies show."\n' +
-    '- SYNTHESIS CLOSE: End the episode with a question or challenge the listener should be able to answer if they absorbed the material — reinforcing active learning, not passive listening.\n\n' +
-    'Ground the episode in the REFERENCE MATERIAL below. You may add well-established general knowledge to ' +
-    'explain and connect ideas, but do NOT invent specific facts, dates, names, statistics, or quotes that ' +
-    'are not supported by the references or that you are not confident are correct.\n\n' +
-    'STYLE: Conversational and clear, no headers or bullet points, written to be heard not read. Keep sentences ' +
-    'short for natural text-to-speech delivery. Briefly connect to the series arc, teach the core ideas with ' +
-    'concrete examples, and end with a one-line bridge to what comes next.\n\n' +
+    '- PREREQUISITE AWARENESS: Build directly on what prior episodes established. Reference earlier concepts by name when relevant.\n' +
+    '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you introduce them.\n' +
+    '- CONCRETE ANALOGIES: Translate research findings into vivid mental models.\n' +
+    '- CITE REAL RESEARCH BY NAME: Name specific researchers and studies from the reference material.\n' +
+    '- SYNTHESIS CLOSE: End with a question the listener should be able to answer if they absorbed the material.\n\n' +
+    'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
+    'statistics, or quotes not supported by the references.\n\n' +
+    'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences for natural TTS.\n\n' +
     'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
-  return callClaude(prompt, 8192);
+
+  const script = await callClaude(prompt, 8192);
+  // Sanitize control characters
+  return script.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
 /* =========================================================================
@@ -1196,7 +1237,9 @@ function classifyTtsError(msg) {
 }
 
 async function generateEpisodeSegments(ep, scriptText) {
-  const parts = splitIntoSegments(scriptText, 200);
+  // Sanitize control characters before segmentation so manifest JSON is always valid
+  const cleanScript = String(scriptText || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
+  const parts = splitIntoSegments(cleanScript, 200);
   ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
   await store.updateEpisode(ep);
   for (let i = 0; i < parts.length; i++) {
@@ -1648,6 +1691,52 @@ app.get('/api/episode/:id/manifest', async (req, res) => {
   const ep = await store.getEpisode(req.params.id);
   if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
   res.json(ep);
+});
+
+/* ----- per-episode regenerate (app's "Tap to retry") -------------------- */
+app.post('/api/episode/:id/regenerate', async (req, res) => {
+  const user = await getReqUser(req);
+  const ep = await store.getEpisode(req.params.id);
+  if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
+  if (ep.status === 'generating' || ep.status === 'queued') {
+    return res.json({ status: ep.status, note: 'Already in progress' });
+  }
+  // Reset episode state
+  ep.status = 'queued';
+  ep.segments = [];
+  ep.error = undefined;
+  ep.errorCode = undefined;
+  await store.updateEpisode(ep);
+  res.json({ status: 'queued' });
+  // Re-run generation in the background using the episode's existing metadata
+  (async () => {
+    try {
+      ep.status = 'generating';
+      await store.updateEpisode(ep);
+      // Get series context for the script prompt
+      const series = ep.seriesId ? await store.getSeries(ep.seriesId) : null;
+      const seriesTopic = series ? series.topic : ep.title;
+      const refs = ep.sources && ep.sources.length ? ep.sources : await retrieveReferences(seriesTopic);
+      const totalEps = series ? series.episodes.length : 1;
+      const priorTitles = series
+        ? series.episodes.filter(e => e.index < ep.index).map(e => e.title)
+        : [];
+      const script = await writeEpisodeScript(
+        seriesTopic, ep.title, ep.lengthMin || 10,
+        ep.index + ' of ' + totalEps, refs, priorTitles
+      );
+      await generateEpisodeSegments(ep, script);
+      // Update series episode status if part of a series
+      if (series) {
+        const ref = series.episodes.find(e => e.id === ep.id);
+        if (ref) { ref.status = ep.status; await store.updateSeries(series); }
+      }
+    } catch (e) {
+      ep.status = 'failed'; ep.error = e.message;
+      await store.updateEpisode(ep);
+      console.log('regenerate failed for', ep.id, ':', e.message);
+    }
+  })();
 });
 
 app.get('/api/series/:id', async (req, res) => {
