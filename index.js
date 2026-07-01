@@ -1403,6 +1403,10 @@ app.get('/api/me', async (req, res) => {
 /* ----- billing/refresh — app calls this on launch to sync Pro status ------- */
 app.post('/api/billing/refresh', async (req, res) => {
   const user = await getReqUser(req);
+  // Developer accounts are always Pro — never let RevenueCat overwrite this
+  if (DEVELOPER_IDS.includes(user.id)) {
+    return res.json({ userId: user.id, tier: 'pro', synced: true, note: 'developer account' });
+  }
   const { appUserId } = req.body || {};
   const rcUserId = appUserId || user.id;
   const RC_SECRET = process.env.REVENUECAT_SECRET_KEY || '';
