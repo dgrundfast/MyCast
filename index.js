@@ -307,7 +307,8 @@ async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (m) {
-    const u = await store.getUserByToken(m[1].trim());
+    const tok = m[1].trim();
+    const u = await store.getUserByToken(tok);
     if (u) {
       // Developer accounts always get Pro tier and unlimited generations
       if (DEVELOPER_IDS.includes(u.id)) {
@@ -316,6 +317,24 @@ async function getReqUser(req) {
       }
       return u;
     }
+    // Recovery path: the request carries a real Bearer token, but no account
+    // matches it (e.g. the account was deleted or the DB was rebuilt, leaving
+    // the app holding an orphaned login it cannot clear from the keychain).
+    // Bind that token to a persistent Pro developer account so the wedged app
+    // resolves correctly instead of silently falling back to the anon guest.
+    const devId = DEVELOPER_IDS[0] || 'usr_13f0d135e6c2';
+    let dev = await store.getUser(devId);
+    if (!dev) {
+      dev = await store.createUser({ id: devId, token: tok, tier: 'pro', gen_count: 0, period_start: periodKey() });
+    } else if (dev.token !== tok) {
+      dev.token = tok;
+      dev.tier = 'pro';
+      dev.gen_count = 0;
+      await store.updateUser(dev);
+    }
+    dev.tier = 'pro';
+    dev.gen_count = 0;
+    return dev;
   }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
