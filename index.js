@@ -367,6 +367,12 @@ function isFinanceTopic(topic) {
   return FINANCE_KEYWORDS.some(k => t.includes(k));
 }
 
+const SPORTS_KEYWORDS = ['nba','nfl','mlb','nhl','soccer','football','basketball','baseball','hockey','tennis','golf','mls','premier league','champions league','lakers','celtics','warriors','bulls','knicks','heat','nets','yankees','dodgers','red sox','cubs','patriots','chiefs','cowboys','49ers','giants','eagles','bruins','rangers','penguins','maple leafs'];
+function isSportsTopic(topic) {
+  const t = String(topic).toLowerCase();
+  return SPORTS_KEYWORDS.some(k => t.includes(k));
+}
+
 /* Curated preset channels: each tile maps to a tuned set of queries (and
    provider hints) so a broad interest like "Markets & Finance" produces a
    clean, reliable briefing instead of whatever a vague typed topic returns. */
@@ -800,20 +806,47 @@ async function retrieveForTopic(topic, windowKey) {
       provider: finance ? 'marketaux(mock)' : 'google_news(mock)',
     }];
   } else {
-    const jobs = isFinanceTopic(topic)
-      ? [fromMarketaux(topic, cutoff), fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)]
-      : [fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)];
-    const settled = await Promise.allSettled(jobs);
-    results = [];
-    for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+    // Sports topics: lead with ESPN scores/records
+    if (isSportsTopic(topic)) {
+      const jobs = [sportsSourceForTopic(topic), fromGoogleNews(topic, cutoff)];
+      const settled = await Promise.allSettled(jobs);
+      results = [];
+      for (const s of settled) {
+        if (s.status === 'fulfilled' && s.value) {
+          if (Array.isArray(s.value)) results.push(...s.value);
+          else results.push(s.value);
+        }
+      }
+    } else if (isFinanceTopic(topic)) {
+      const marketData = await fromAlphaVantage();
+      const jobs = [fromMarketaux(topic, cutoff), fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)];
+      const settled = await Promise.allSettled(jobs);
+      results = marketData ? [Object.assign({}, marketData, { topic })] : [];
+      for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+    } else {
+      // General topics: premium RSS first, then Google News
+      const [premium, gnews, currents] = await Promise.allSettled([
+        fromPremiumRSS(topic, cutoff, false),
+        fromGoogleNews(topic, cutoff),
+        fromCurrents(topic, cutoff),
+      ]);
+      results = [];
+      if (premium.status === 'fulfilled') results.push(...premium.value);
+      if (gnews.status === 'fulfilled') results.push(...gnews.value);
+      if (currents.status === 'fulfilled') results.push(...currents.value);
+    }
     results = dedupeSources(results)
-      .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
-      .slice(0, 6); // per-topic cap (keeps one broad topic from flooding the brief)
+      .sort((a, b) => {
+        if (a.priority && !b.priority) return -1;
+        if (!a.priority && b.priority) return 1;
+        const qa = sourceQualityScore(a), qb = sourceQualityScore(b);
+        if (qa !== qb) return qb - qa;
+        return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+      })
+      .slice(0, 8);
     // pull real article text for the top few so the writer has concrete facts
     await Promise.all(results.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
   }
-  // sports topics: lead with exact scores/schedule rather than vague news
-  try { const sp = await sportsSourceForTopic(topic); if (sp) results = [sp, ...results]; } catch (e) {}
   retrievalCache.set(cacheKey, { at: Date.now(), data: results });
   return results;
 }
@@ -981,12 +1014,23 @@ function sourcesBlock(sources) {
   return out;
 }
 
-async function writeBriefScript(topics, windowKey, sources, lengthMin) {
+async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) {
   const targetWords = Math.round(lengthMin * 160);
+  const dateCtx = currentDateContext();
+  // Sort sources by quality score so Reuters/AP/BBC lead
+  const sortedSources = (sources || []).slice().sort((a, b) => sourceQualityScore(b) - sourceQualityScore(a));
+  // Determine time-of-day greeting from UTC hour
+  const hour = new Date().getUTCHours();
+  const greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
+  // Voice-matched rhythm instruction
+  const voiceStyle = voiceId && /rachel|bella|elli|sophie/.test(String(voiceId).toLowerCase())
+    ? 'Calm, measured delivery — use slightly longer sentences with natural pauses built in.'
+    : 'Energetic, punchy delivery — short sentences, strong verbs, brisk pacing.';
   const prompt =
     'PERSONA: You are "The Wire Editor" — a senior news editor with 20 years in broadcast journalism. ' +
     'You have synthesized thousands of breaking stories into clear, trustworthy briefings. You write the way ' +
     'the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
+    dateCtx + '\n\n' +
     'Write ONE script of about ' + targetWords + ' words.\n\n' +
     'Cover these topics IN THIS ORDER, each as its own clear section:\n' +
     topics.map((t, i) => (i + 1) + '. ' + t).join('\n') + '\n\n' +
@@ -1009,10 +1053,11 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin) {
     '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
     '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
     '- Ban stale transitions: never start consecutive stories with "In other news," "Meanwhile," or "Moving on." Vary the connective tissue between stories.\n' +
+    '- VOICE STYLE: ' + voiceStyle + '\n' +
     '- Keep sentences SHORT for natural text-to-speech delivery — one clear idea per sentence reads far better aloud than long compound clauses.\n' +
     '- Spoken aloud — brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
     'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours; each item may include the article text):\n' +
-    sourcesBlock(sources);
+    sourcesBlock(sortedSources);
   return callClaude(prompt, 8192);
 }
 
@@ -1242,11 +1287,15 @@ async function writeDeepDivePlan(topic, depthKey) {
     'paths for top universities and professional training programs. You understand how people actually learn: ' +
     'progressively, with each concept scaffolded on the last, never assuming prior knowledge the learner hasn\'t earned yet.\n\n' +
     'Plan a ' + n + '-episode audio mini-series that takes a listener from zero to "' +
-    (DEPTH[depthKey] || DEPTH.conversational).label + '" knowledge of: ' + topic + '.\n' +
-    'PEDAGOGICAL STRUCTURE: Order episodes so foundational concepts come first and advanced applications come last. ' +
-    'Each episode title should signal what specific capability or understanding the listener gains — not just a topic label.\n' +
-    'Return ONLY the ' + n + ' episode titles, one per line, no numbering, no extra text. ' +
-    'Order them so each builds on the last.';
+    (DEPTH[depthKey] || DEPTH.conversational).label + '" knowledge of: ' + topic + '.\n\n' +
+    'TITLE RULES (this is critical):\n' +
+    '- Titles must sound like real podcast episode titles — compelling, specific, intriguing.\n' +
+    '- Never use generic titles like "Introduction to X" or "Episode 1: Overview." Those are boring.\n' +
+    '- Use the specific angle or insight the episode reveals: "The Loop Your Brain Can\'t Escape" beats "How Habits Work."\n' +
+    '- Each title should make someone genuinely curious to listen to that specific episode.\n' +
+    '- Titles should signal what capability or insight the listener gains, not just the topic covered.\n\n' +
+    'PEDAGOGICAL STRUCTURE: Order episodes so foundational concepts come first and advanced applications come last.\n' +
+    'Return ONLY the ' + n + ' episode titles, one per line, no numbering, no extra text.';
   const text = await callClaude(prompt, 1024);
   const titles = text.split('\n').map(t => t.replace(/^\s*[-\d.)]+\s*/, '').trim()).filter(Boolean);
   while (titles.length < n) titles.push(topic + ' — Part ' + (titles.length + 1));
@@ -1267,8 +1316,11 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
     const halfWords = Math.round(targetWords / 2);
     const basePrompt = 'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
       'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
+      currentDateContext() + '\n\n' +
       'You are writing episode "' + episodeTitle + '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
       priorContext +
+      'OPENING HOOK (first half only, critical): The very first sentence must make the listener lean in immediately. ' +
+      'Not "In this episode we will..." — that is forbidden. Open with a surprising fact, provocative question, or vivid scene.\n\n' +
       'TEACHING METHOD:\n' +
       '- PREREQUISITE AWARENESS: Build directly on what prior episodes established.\n' +
       '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you use them.\n' +
@@ -1302,9 +1354,15 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
   const prompt =
     'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
     'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
+    currentDateContext() + '\n\n' +
     'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
     '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
     priorContext +
+    'OPENING HOOK (critical): The very first sentence must be a hook that makes the listener lean in. ' +
+    'Not "In this episode we will explore..." — that is forbidden. Instead, open with a surprising fact, ' +
+    'a provocative question, a counterintuitive claim, or a vivid scene that immediately rewards attention. ' +
+    'Example of bad opening: "Today we\'re going to talk about habit formation." ' +
+    'Example of good opening: "There\'s a part of your brain that runs on autopilot, and once it takes over, your conscious mind is just along for the ride."\n\n' +
     'TEACHING METHOD (this is the whole job):\n' +
     '- PREREQUISITE AWARENESS: Build directly on what prior episodes established. Reference earlier concepts by name when relevant.\n' +
     '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you introduce them.\n' +
@@ -1469,7 +1527,7 @@ async function buildBriefEpisode(user, cfg, opts) {
     try {
       ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
       await store.updateEpisode(ep);
-      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin);
+      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId);
       await generateEpisodeSegments(ep, script);
       await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
       // Populate the popular-combo cache for shared, topic-free combos so the
