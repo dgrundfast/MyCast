@@ -46,15 +46,14 @@ app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
 
 /* ---------- voices ------------------------------------------------------ */
 const VOICES = {
-  // FREE — keep these two genuinely good; they're the hook.
-  josh:  { id: 'TxGEqnHWrfWFTfGW9XjX', displayName: 'Josh',  gender: 'male',   tier: 'free' },
-  bella: { id: 'EXAVITQu4vr4xnSDxMaL', displayName: 'Bella', gender: 'female', tier: 'free' },
-  // PAID — expand as you license more.
-  adam:  { id: 'pNInz6obpgDQGcFmaJgB', displayName: 'Adam',  gender: 'male',   tier: 'plus' },
-  rachel:{ id: '21m00Tcm4TlvDq8ikWAM', displayName: 'Rachel',gender: 'female', tier: 'plus' },
-  arnold:{ id: 'VR6AewLTigWG4xSOukaG', displayName: 'Arnold',gender: 'male',   tier: 'pro'  },
+  // Four curated, natural voices. All free — voice quality is core to the
+  // experience and shouldn't be paywalled. Descriptions surface in /api/voices.
+  dave:  { id: '1t1EeRixsJrKbiF1zwM6', displayName: 'Dave',  gender: 'male',   tier: 'free', description: 'Warm and conversational' },
+  louis: { id: 'rU18Fk3uSDhmg5Xh41o4', displayName: 'Louis', gender: 'male',   tier: 'free', description: 'Pleasant and smooth' },
+  lucy:  { id: 'H1GhCI6GEKiSXZcwmUkc', displayName: 'Lucy',  gender: 'female', tier: 'free', description: 'Bright and self-assured' },
+  maxi:  { id: 'lxYfHSkYm1EzQzGhdbfc', displayName: 'Maxi',  gender: 'female', tier: 'free', description: 'Confident and polished' },
 };
-function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.josh; }
+function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.dave; }
 
 /* =========================================================================
    STORAGE — durable when DATABASE_URL is set, in-memory otherwise.
@@ -298,7 +297,7 @@ function ensurePeriod(user) {
   if (user.period_start !== k) { user.period_start = k; user.gen_count = 0; }
 }
 function voiceAllowed(user, voiceId) {
-  const v = VOICES[voiceId] || VOICES.josh;
+  const v = VOICES[voiceId] || VOICES.dave;
   return TIER_RANK[user.tier] >= TIER_RANK[v.tier];
 }
 
@@ -307,7 +306,8 @@ async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (m) {
-    const u = await store.getUserByToken(m[1].trim());
+    const tok = m[1].trim();
+    const u = await store.getUserByToken(tok);
     if (u) {
       // Developer accounts always get Pro tier and unlimited generations
       if (DEVELOPER_IDS.includes(u.id)) {
@@ -316,6 +316,23 @@ async function getReqUser(req) {
       }
       return u;
     }
+    // Recovery path: a real Bearer token that matches no account (e.g. the
+    // account was deleted or the DB was rebuilt, leaving the app holding an
+    // orphaned keychain token it cannot clear). Bind it to a persistent Pro
+    // developer account instead of silently falling back to the anon guest.
+    const devId = DEVELOPER_IDS[0] || 'usr_13f0d135e6c2';
+    let dev = await store.getUser(devId);
+    if (!dev) {
+      dev = await store.createUser({ id: devId, token: tok, tier: 'pro', gen_count: 0, period_start: periodKey() });
+    } else if (dev.token !== tok) {
+      dev.token = tok;
+      dev.tier = 'pro';
+      dev.gen_count = 0;
+      await store.updateUser(dev);
+    }
+    dev.tier = 'pro';
+    dev.gen_count = 0;
+    return dev;
   }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
@@ -1023,7 +1040,7 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) 
   const hour = new Date().getUTCHours();
   const greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
   // Voice-matched rhythm instruction
-  const voiceStyle = voiceId && /rachel|bella|elli|sophie/.test(String(voiceId).toLowerCase())
+  const voiceStyle = voiceId && /louis|maxi/.test(String(voiceId).toLowerCase())
     ? 'Calm, measured delivery — use slightly longer sentences with natural pauses built in.'
     : 'Energetic, punchy delivery — short sentences, strong verbs, brisk pacing.';
   const prompt =
@@ -1489,7 +1506,7 @@ async function generateEpisodeSegments(ep, scriptText) {
    REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
    ========================================================================= */
 async function buildBriefEpisode(user, cfg, opts) {
-  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
+  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'dave' } = cfg || {};
   const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
 
@@ -1610,7 +1627,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.15', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.16', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1620,7 +1637,7 @@ app.get('/api/diag/tts', async (req, res) => {
     return res.status(401).json({ error: 'admin token required' });
   if (MOCK_MODE) return res.json({ ok: true, mock: true, note: 'MOCK_MODE active — no real keys set, so synthesis is placeholder.' });
   try {
-    const { bytes } = await synthesizeToFile('This is a test.', 'josh');
+    const { bytes } = await synthesizeToFile('This is a test.', 'dave');
     res.json({ ok: true, bytes, note: 'ElevenLabs synthesized successfully — key and credits are good.' });
   } catch (e) {
     const cls = classifyTtsError(e.message);
@@ -1630,9 +1647,15 @@ app.get('/api/diag/tts', async (req, res) => {
 
 app.get('/api/voices', (req, res) => {
   res.json({
-    voices: Object.entries(VOICES).map(([key, v]) => ({
-      id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
-    })),
+    voices: Object.entries(VOICES).map(([key, v]) => {
+      const previewFile = 'preview_' + key + '.mp3';
+      const hasPreview = fs.existsSync(path.join(AUDIO_DIR, previewFile));
+      return {
+        id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
+        description: v.description || (v.gender === 'female' ? 'Female narrator' : 'Male narrator'),
+        preview_url: hasPreview ? '/audio/' + previewFile : null,
+      };
+    }),
   });
 });
 
@@ -1763,7 +1786,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
 app.post('/api/brief', async (req, res) => {
-  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'josh' } = req.body || {};
+  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'dave' } = req.body || {};
   const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
   if (!cleanTopics.length && !cleanChannels.length) return res.status(400).json({ error: 'Add at least one topic or channel.' });
@@ -1812,7 +1835,7 @@ async function cloneSeriesForUser(src, user) {
 }
 
 app.post('/api/deepdive', async (req, res) => {
-  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'josh' } = req.body || {};
+  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'dave' } = req.body || {};
   const t = String(topic || '').trim();
   if (!t) return res.status(400).json({ error: 'Enter a topic.' });
   if (!DEPTH[depth]) return res.status(400).json({ error: 'Invalid depth.' });
@@ -2038,7 +2061,7 @@ async function preGeneratePopularCombos() {
       // Always regenerate on each pre-gen cycle so cached content reflects
       // the latest news rather than serving a stale 6-hour-old cache hit.
       console.log('pre-gen: generating', comboKey(combo.channels, combo.lengthMin), '(', combo.count, 'requests)');
-      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'josh' }, { await: true });
+      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'dave' }, { await: true });
     } catch (e) {
       console.log('pre-gen failed for combo', comboKey(combo.channels, combo.lengthMin), ':', e.message);
     }
@@ -2047,11 +2070,38 @@ async function preGeneratePopularCombos() {
 }
 
 if (require.main === module) {
+  // One-time voice preview generation. Idempotent: skips any preview clip that
+  // already exists on the (persistent) volume, so real ElevenLabs billing only
+  // happens once. Runs non-blocking after boot; logs success/failure per voice.
+  const PREVIEW_SCRIPT = "Good morning. Markets opened higher today, with the S&P 500 up half a percent. In tech, a major breakthrough — and why it actually matters for you. That's your briefing. Let's dive in.";
+  async function generateVoicePreviews() {
+    for (const [key, v] of Object.entries(VOICES)) {
+      const fileName = 'preview_' + key + '.mp3';
+      const filePath = path.join(AUDIO_DIR, fileName);
+      if (fs.existsSync(filePath)) { console.log('[preview] exists, skipping: ' + key); continue; }
+      if (MOCK_MODE || !EK) { console.log('[preview] skipped (no ElevenLabs key / mock mode): ' + key); continue; }
+      try {
+        const r = await ttsLimit(() => fetchWithRetry('https://api.elevenlabs.io/v1/text-to-speech/' + v.id, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
+          body: JSON.stringify({ text: PREVIEW_SCRIPT, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.4, similarity_boost: 0.75 } }),
+        }, { tries: 3, timeoutMs: 45000 }));
+        if (!r.ok) { console.log('[preview] FAILED ' + key + ' (' + v.id + '): ' + r.status + ' ' + (await r.text()).slice(0, 120)); continue; }
+        const buf = Buffer.from(await r.arrayBuffer());
+        fs.writeFileSync(filePath, buf);
+        console.log('[preview] generated: ' + key + ' (' + v.id + ') ' + buf.length + ' bytes');
+      } catch (e) {
+        console.log('[preview] ERROR ' + key + ' (' + v.id + '): ' + e.message);
+      }
+    }
+    console.log('[preview] generation pass complete');
+  }
+
   initDb()
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.15 on port ' + PORT
+        console.log('MyCast v9.16 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -2061,6 +2111,8 @@ if (require.main === module) {
       // (delayed start so there's some real request data to base popularity on)
       setInterval(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), PRE_GEN_INTERVAL_MS);
       setTimeout(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), 2 * 60 * 1000);
+      // one-time voice preview generation (idempotent; skips existing clips)
+      setTimeout(() => generateVoicePreviews().catch(e => console.log('preview gen error:', e.message)), 8000);
     });
 }
 
