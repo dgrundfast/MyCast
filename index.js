@@ -410,6 +410,27 @@ function hostnameOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
+// Rank sources by outlet quality so wire services lead the writer's context.
+// Tier 3: Reuters / AP / BBC. Tier 2: Bloomberg / FT / WSJ / ESPN. Else 1.
+function sourceQualityScore(s) {
+  const hay = (((s && s.publisher) || '') + ' ' + ((s && s.url) ? hostnameOf(s.url) : '')).toLowerCase();
+  if (/reuters|associated press|ap news|apnews|bbc/.test(hay)) return 3;
+  if (/bloomberg|financial times|ft\.com|wall street journal|wsj|espn/.test(hay)) return 2;
+  return 1;
+}
+
+// Human-readable current date/time context injected into generation prompts so
+// scripts reference "today" correctly (day of week, date, and time of day).
+function currentDateContext() {
+  const now = new Date();
+  const day = now.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+  const date = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+  const h = now.getUTCHours();
+  const partOfDay = h < 12 ? 'morning' : (h < 17 ? 'afternoon' : 'evening');
+  return 'CURRENT DATE: Today is ' + day + ', ' + date + ' (' + partOfDay + ', UTC). ' +
+    'Treat this as the present moment; refer to recent events as current and do not claim a different date.';
+}
+
 function normTitle(t) {
   return String(t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 70);
 }
@@ -1627,7 +1648,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.16', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.17', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2101,7 +2122,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.16 on port ' + PORT
+        console.log('MyCast v9.17 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
