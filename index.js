@@ -477,6 +477,138 @@ async function fromGoogleNews(topic, cutoff) {
   } catch (e) { console.log('google_news error:', e.message); return []; }
 }
 
+
+/* ---- Premium RSS feeds: AP, Reuters, BBC (free, no key, high quality) ---- */
+const PREMIUM_RSS_FEEDS = {
+  world: [
+    'https://feeds.bbci.co.uk/news/world/rss.xml',
+    'https://rss.app/feeds/AP-world-news.xml',
+    'https://feeds.reuters.com/reuters/worldNews',
+  ],
+  technology: [
+    'https://feeds.bbci.co.uk/news/technology/rss.xml',
+    'https://rss.app/feeds/AP-technology.xml',
+  ],
+  business: [
+    'https://feeds.bbci.co.uk/news/business/rss.xml',
+    'https://feeds.reuters.com/reuters/businessNews',
+  ],
+  health: [
+    'https://feeds.bbci.co.uk/news/health/rss.xml',
+    'https://rss.app/feeds/AP-health.xml',
+  ],
+  science: [
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://rss.app/feeds/AP-science.xml',
+  ],
+  politics: [
+    'https://feeds.bbci.co.uk/news/politics/rss.xml',
+    'https://rss.app/feeds/AP-politics.xml',
+  ],
+  entertainment: [
+    'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+  ],
+};
+
+// Channel ID -> feed list mapping
+const CHANNEL_RSS_MAP = {
+  world: PREMIUM_RSS_FEEDS.world,
+  politics: PREMIUM_RSS_FEEDS.politics,
+  technology: PREMIUM_RSS_FEEDS.technology,
+  markets: PREMIUM_RSS_FEEDS.business,
+  business: PREMIUM_RSS_FEEDS.business,
+  science: PREMIUM_RSS_FEEDS.science,
+  health: PREMIUM_RSS_FEEDS.health,
+  entertainment: PREMIUM_RSS_FEEDS.entertainment,
+};
+
+async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
+  const feeds = isChannel
+    ? (CHANNEL_RSS_MAP[channelIdOrTopic] || PREMIUM_RSS_FEEDS.world)
+    : PREMIUM_RSS_FEEDS.world; // fallback for topic searches
+  const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
+  const out = [];
+  for (const feedUrl of feeds) {
+    try {
+      const feed = await rss.parseURL(feedUrl);
+      for (const item of feed.items || []) {
+        const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
+        if (isNaN(ts) || ts < fallbackCutoff) continue;
+        // Determine publisher from feed URL
+        let publisher = 'BBC News';
+        if (feedUrl.includes('reuters')) publisher = 'Reuters';
+        else if (feedUrl.includes('AP') || feedUrl.includes('ap-')) publisher = 'Associated Press';
+        out.push({
+          topic: channelIdOrTopic,
+          publisher,
+          title: (item.title || '').trim(),
+          url: item.link,
+          publishedAt: new Date(ts).toISOString(),
+          snippet: (item.contentSnippet || item.summary || '').slice(0, 400),
+          provider: 'premium_rss',
+          withinWindow: ts >= cutoff,
+          priority: true, // premium sources lead
+        });
+      }
+    } catch (e) {
+      console.log('premium_rss error [' + feedUrl + ']:', e.message);
+    }
+  }
+  // Sort: within-window first, then by recency
+  out.sort((a, b) => {
+    if (a.withinWindow && !b.withinWindow) return -1;
+    if (!a.withinWindow && b.withinWindow) return 1;
+    return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+  });
+  return out.slice(0, 12); // top 12 from premium sources
+}
+
+/* ---- Alpha Vantage for real market index data (free, requires API key) --- */
+const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_API_KEY || '';
+async function fromAlphaVantage() {
+  if (!ALPHA_VANTAGE_KEY) return null;
+  try {
+    // Fetch DJIA, S&P 500, and NASDAQ
+    const symbols = [
+      { symbol: 'DIA', name: 'Dow Jones (DJIA)' },
+      { symbol: 'SPY', name: 'S&P 500' },
+      { symbol: 'QQQ', name: 'NASDAQ' },
+    ];
+    const results = await Promise.allSettled(symbols.map(async ({ symbol, name }) => {
+      const url = 'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=' +
+        symbol + '&apikey=' + ALPHA_VANTAGE_KEY;
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 8000);
+      const r = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!r.ok) return null;
+      const d = await r.json();
+      const q = d['Global Quote'];
+      if (!q || !q['05. price']) return null;
+      const price = parseFloat(q['05. price']).toFixed(2);
+      const change = parseFloat(q['09. change']).toFixed(2);
+      const changePct = parseFloat(q['10. change percent']).toFixed(2);
+      const direction = change >= 0 ? 'up' : 'down';
+      return name + ': ' + price + ' (' + direction + ' ' + Math.abs(change) + ', ' + changePct + '%)';
+    }));
+    const lines = results
+      .filter(r => r.status === 'fulfilled' && r.value)
+      .map(r => r.value);
+    if (!lines.length) return null;
+    return {
+      publisher: 'Alpha Vantage',
+      title: 'Market Index Summary',
+      snippet: lines.join(' | '),
+      provider: 'alpha_vantage',
+      publishedAt: new Date().toISOString(),
+      priority: true,
+    };
+  } catch (e) {
+    console.log('alpha_vantage error:', e.message);
+    return null;
+  }
+}
+
 async function fromCurrents(topic, cutoff) {
   if (!CURRENTS_API_KEY) return [];
   try {
@@ -717,16 +849,35 @@ async function retrieveForChannel(channelId, windowKey) {
     }];
   } else {
     results = [];
-    for (const q of ch.queries) {
-      const jobs = ch.finance
-        ? [fromMarketaux(q, cutoff), fromGoogleNews(q, cutoff)]
-        : [fromGoogleNews(q, cutoff), fromCurrents(q, cutoff)];
-      const settled = await Promise.allSettled(jobs);
-      for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+
+    // Premium RSS feeds first (AP, Reuters, BBC) — highest quality, most reliable
+    const premiumResults = await fromPremiumRSS(channelId, cutoff, true);
+    results.push(...premiumResults);
+
+    // Finance channels: add real market index data from Alpha Vantage
+    if (ch.finance) {
+      const marketData = await fromAlphaVantage();
+      if (marketData) results.unshift(Object.assign({}, marketData, { topic: ch.label }));
+      const [marketaux, gnews] = await Promise.allSettled(
+        ch.queries.map(q => fromMarketaux(q, cutoff)).concat(ch.queries.map(q => fromGoogleNews(q, cutoff)))
+      );
+      for (const s of [marketaux, gnews]) if (s && s.status === 'fulfilled') results.push(...(s.value || []));
+    } else {
+      // Non-finance: premium RSS + Google News for each channel query
+      for (const q of ch.queries) {
+        const settled = await Promise.allSettled([fromGoogleNews(q, cutoff), fromCurrents(q, cutoff)]);
+        for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
+      }
     }
+
     results = dedupeSources(results.map(r => Object.assign({}, r, { topic: ch.label })))
-      .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
-      .slice(0, 6);
+      .sort((a, b) => {
+        // Priority sources (AP, Reuters, BBC, Alpha Vantage) always lead
+        if (a.priority && !b.priority) return -1;
+        if (!a.priority && b.priority) return 1;
+        return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+      })
+      .slice(0, 10); // more sources = richer briefing
   }
   retrievalCache.set(cacheKey, { at: Date.now(), data: results });
   return results;
@@ -851,7 +1002,9 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin) {
     '- Use ONLY the source material below, grouped by topic; for each topic use only that topic\'s sources.\n' +
     '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
     '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
-    '- If a topic genuinely has no relevant sources, say so in one short sentence and move on.\n\n' +
+    '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n\n' +
+    'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S&P 500 rose 0.8% to close at 5,432, the Dow gained 180 points, and the NASDAQ slipped 0.3%." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
+    'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112-98 last night, improving to 41-28 on the season, while Boston falls to 45-24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
     'STYLE & VOICE:\n' +
     '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
     '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
