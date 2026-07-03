@@ -48,10 +48,10 @@ app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
 const VOICES = {
   // Four curated, natural voices. All free — voice quality is core to the
   // experience and shouldn't be paywalled. Descriptions surface in /api/voices.
-  dave:  { id: '1t1EeRixsJrKbiF1zwM6', displayName: 'Dave',  gender: 'male',   tier: 'free', description: 'Warm and conversational' },
-  louis: { id: 'rU18Fk3uSDhmg5Xh41o4', displayName: 'Louis', gender: 'male',   tier: 'free', description: 'Pleasant and smooth' },
-  lucy:  { id: 'H1GhCI6GEKiSXZcwmUkc', displayName: 'Lucy',  gender: 'female', tier: 'free', description: 'Bright and self-assured' },
-  maxi:  { id: 'lxYfHSkYm1EzQzGhdbfc', displayName: 'Maxi',  gender: 'female', tier: 'free', description: 'Confident and polished' },
+  dave:  { id: 'hxPRa8HUuKYsm1kiWDEi', displayName: 'Dave',  gender: 'male',   tier: 'free', description: 'Energetic and engaging' },
+  louis: { id: 'wtQQHWfMy9WeIYuth5ga', displayName: 'Louis', gender: 'male',   tier: 'free', description: 'Warm and steady' },
+  lucy:  { id: 'WZlYpi1yf6zJhNWXih74', displayName: 'Lucy',  gender: 'female', tier: 'free', description: 'Clear and professional' },
+  maxi:  { id: 'RaFzMbMIfqBcIurH6XF9', displayName: 'Maxi',  gender: 'female', tier: 'free', description: 'Calm and measured' },
 };
 function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.dave; }
 
@@ -1656,7 +1656,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.19', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.20', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1677,7 +1677,7 @@ app.get('/api/diag/tts', async (req, res) => {
 app.get('/api/voices', (req, res) => {
   res.json({
     voices: Object.entries(VOICES).map(([key, v]) => {
-      const previewFile = 'preview_' + key + '.mp3';
+      const previewFile = 'preview_' + v.id + '.mp3';
       const hasPreview = fs.existsSync(path.join(AUDIO_DIR, previewFile));
       return {
         id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
@@ -2105,7 +2105,7 @@ if (require.main === module) {
   const PREVIEW_SCRIPT = "Good morning. Markets opened higher today, with the S&P 500 up half a percent. In tech, a major breakthrough — and why it actually matters for you. That's your briefing. Let's dive in.";
   async function generateVoicePreviews() {
     for (const [key, v] of Object.entries(VOICES)) {
-      const fileName = 'preview_' + key + '.mp3';
+      const fileName = 'preview_' + v.id + '.mp3';
       const filePath = path.join(AUDIO_DIR, fileName);
       if (fs.existsSync(filePath)) { console.log('[preview] exists, skipping: ' + key); continue; }
       if (MOCK_MODE || !EK) { console.log('[preview] skipped (no ElevenLabs key / mock mode): ' + key); continue; }
@@ -2130,7 +2130,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.19 on port ' + PORT
+        console.log('MyCast v9.20 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
