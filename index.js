@@ -368,6 +368,14 @@ async function reserveGeneration(user, count) {
    ========================================================================= */
 const CURRENTS_API_KEY  = process.env.CURRENTS_API_KEY  || '';
 const MARKETAUX_API_KEY = process.env.MARKETAUX_API_KEY || '';
+const NEWSDATA_API_KEY  = process.env.NEWSDATA_API_KEY  || '';
+// Lightweight daily usage tracking for the preferred-sources (NewsData) API so
+// /api/health can surface consumption and quota hits before UX degrades.
+const newsdataStats = { day: new Date().toISOString().slice(0, 10), callsToday: 0, quotaHitsToday: 0 };
+function bumpNewsdataDay() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== newsdataStats.day) { newsdataStats.day = d; newsdataStats.callsToday = 0; newsdataStats.quotaHitsToday = 0; }
+}
 
 // Best-effort finance detector. Misses only cost a finance topic its
 // finance-specific provider — Google News still covers it — so we keep this
@@ -1015,6 +1023,134 @@ async function retrieveAll(topics, channels, windowKey) {
 }
 
 /* =========================================================================
+   PREFERRED SOURCES (NewsData.io) — users pick outlets they trust; the brief
+   runs an extra domain-restricted pass against those publishers and leads the
+   script with their reporting. Purely ADDITIVE: any failure/quota/empty result
+   silently falls back to the normal pipeline, so a brief never comes back thin.
+   Public content only (headlines/summaries) — never paywalled article bodies.
+   ========================================================================= */
+// Backend-owned catalog (mirrors /api/channels): edit here, no app update needed.
+const PUBLISHERS = [
+  // General / wire
+  { id: 'ap',        label: 'Associated Press',      domain: 'apnews.com',        category: 'General' },
+  { id: 'reuters',   label: 'Reuters',               domain: 'reuters.com',       category: 'General' },
+  { id: 'nyt',       label: 'The New York Times',    domain: 'nytimes.com',       category: 'General' },
+  { id: 'washpost',  label: 'The Washington Post',   domain: 'washingtonpost.com',category: 'General' },
+  { id: 'guardian',  label: 'The Guardian',          domain: 'theguardian.com',   category: 'General' },
+  { id: 'bbc',       label: 'BBC News',              domain: 'bbc.com',           category: 'General' },
+  { id: 'npr',       label: 'NPR',                   domain: 'npr.org',           category: 'General' },
+  { id: 'usatoday',  label: 'USA Today',             domain: 'usatoday.com',      category: 'General' },
+  { id: 'cbsnews',   label: 'CBS News',              domain: 'cbsnews.com',       category: 'General' },
+  { id: 'nbcnews',   label: 'NBC News',              domain: 'nbcnews.com',       category: 'General' },
+  { id: 'abcnews',   label: 'ABC News',              domain: 'abcnews.go.com',    category: 'General' },
+  { id: 'latimes',   label: 'Los Angeles Times',     domain: 'latimes.com',       category: 'General' },
+  { id: 'aljazeera', label: 'Al Jazeera',            domain: 'aljazeera.com',     category: 'General' },
+  // Finance / markets
+  { id: 'wsj',       label: 'The Wall Street Journal',domain: 'wsj.com',          category: 'Finance' },
+  { id: 'bloomberg', label: 'Bloomberg',             domain: 'bloomberg.com',     category: 'Finance' },
+  { id: 'cnbc',      label: 'CNBC',                  domain: 'cnbc.com',          category: 'Finance' },
+  { id: 'barrons',   label: "Barron's",              domain: 'barrons.com',       category: 'Finance' },
+  { id: 'ft',        label: 'Financial Times',       domain: 'ft.com',            category: 'Finance' },
+  { id: 'marketwatch',label: 'MarketWatch',          domain: 'marketwatch.com',   category: 'Finance' },
+  { id: 'economist', label: 'The Economist',         domain: 'economist.com',     category: 'Finance' },
+  { id: 'forbes',    label: 'Forbes',                domain: 'forbes.com',        category: 'Finance' },
+  { id: 'businessinsider', label: 'Business Insider',domain: 'businessinsider.com',category: 'Finance' },
+  // Tech
+  { id: 'techcrunch',label: 'TechCrunch',            domain: 'techcrunch.com',    category: 'Tech' },
+  { id: 'verge',     label: 'The Verge',             domain: 'theverge.com',      category: 'Tech' },
+  { id: 'wired',     label: 'Wired',                 domain: 'wired.com',         category: 'Tech' },
+  { id: 'arstechnica',label: 'Ars Technica',         domain: 'arstechnica.com',   category: 'Tech' },
+  { id: 'engadget',  label: 'Engadget',              domain: 'engadget.com',      category: 'Tech' },
+  // Politics
+  { id: 'politico',  label: 'Politico',              domain: 'politico.com',      category: 'Politics' },
+  { id: 'thehill',   label: 'The Hill',              domain: 'thehill.com',       category: 'Politics' },
+  { id: 'axios',     label: 'Axios',                 domain: 'axios.com',         category: 'Politics' },
+  // Entertainment / culture
+  { id: 'variety',   label: 'Variety',               domain: 'variety.com',       category: 'Entertainment' },
+  { id: 'thr',       label: 'The Hollywood Reporter',domain: 'hollywoodreporter.com', category: 'Entertainment' },
+  { id: 'rollingstone',label: 'Rolling Stone',       domain: 'rollingstone.com',  category: 'Entertainment' },
+  { id: 'ew',        label: 'Entertainment Weekly',  domain: 'ew.com',            category: 'Entertainment' },
+  { id: 'billboard', label: 'Billboard',             domain: 'billboard.com',     category: 'Entertainment' },
+  // Sports
+  { id: 'espn',      label: 'ESPN',                  domain: 'espn.com',          category: 'Sports' },
+  { id: 'theathletic',label: 'The Athletic',         domain: 'nytimes.com/athletic', category: 'Sports' },
+  { id: 'cbssports', label: 'CBS Sports',            domain: 'cbssports.com',     category: 'Sports' },
+  { id: 'bleacherreport', label: 'Bleacher Report',  domain: 'bleacherreport.com',category: 'Sports' },
+  // Science / health
+  { id: 'sciam',     label: 'Scientific American',   domain: 'scientificamerican.com', category: 'Science' },
+  { id: 'natgeo',    label: 'National Geographic',   domain: 'nationalgeographic.com', category: 'Science' },
+  { id: 'statnews',  label: 'STAT',                  domain: 'statnews.com',      category: 'Health' },
+];
+const PUBLISHERS_BY_ID = Object.fromEntries(PUBLISHERS.map(p => [p.id, p]));
+
+// Query NewsData restricted to specific publisher domains. Returns [] on ANY
+// failure (missing key, HTTP error, quota/429, bad payload) so callers can
+// silently fall back. Never throws.
+async function fromNewsData(query, domains, cutoff) {
+  if (!NEWSDATA_API_KEY || !query) return [];
+  bumpNewsdataDay();
+  try {
+    let url = 'https://newsdata.io/api/1/latest?apikey=' + NEWSDATA_API_KEY
+      + '&language=en&q=' + encodeURIComponent(query);
+    if (domains && domains.length) url += '&domainurl=' + encodeURIComponent(domains.join(','));
+    newsdataStats.callsToday++;
+    const r = await fetch(url);
+    if (r.status === 429) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded (429)'); return []; }
+    if (!r.ok) { console.log('newsdata http ' + r.status); return []; }
+    const d = await r.json();
+    if (!d || d.status !== 'success' || !Array.isArray(d.results)) {
+      const code = d && d.results && d.results.code;
+      if (code && /rate|limit|quota/i.test(String(code))) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded:', code); }
+      return [];
+    }
+    const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    const out = [];
+    for (const n of d.results) {
+      if (!n || !n.link || !n.title) continue;
+      const raw = n.pubDate ? String(n.pubDate).replace(' ', 'T') : '';
+      const ts = raw ? Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : raw + 'Z') : NaN;
+      if (isNaN(ts) || ts < fallbackCutoff) continue;
+      out.push({
+        topic: query,
+        publisher: n.source_name || hostnameOf(n.link) || 'News',
+        title: n.title, url: n.link,
+        publishedAt: new Date(ts).toISOString(),
+        snippet: (n.description || '').slice(0, 280),
+        provider: 'newsdata',
+        preferred: true,                 // lead the script + manifest with these
+        withinWindow: ts >= cutoff,
+      });
+    }
+    return out;
+  } catch (e) { console.log('newsdata error:', e.message); return []; }
+}
+
+// Run the preferred-source pass for a brief: resolve publisher ids -> domains,
+// query NewsData per section label, dedupe, recency-sort. Cached like the rest.
+const preferredCache = new Map();
+async function fetchPreferredSources(labels, prefIds, windowKey) {
+  const domains = [];
+  for (const pid of (prefIds || [])) { const p = PUBLISHERS_BY_ID[pid]; if (p && p.domain) domains.push(p.domain); }
+  if (!domains.length || !NEWSDATA_API_KEY) return [];
+  const cacheKey = 'pref:' + domains.slice().sort().join(',') + '|' + (labels || []).join('~') + '|' + windowKey;
+  const cached = preferredCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
+  const hours = WINDOW_HOURS[windowKey] || 24;
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  const settled = await Promise.allSettled((labels || []).slice(0, 8).map(q => fromNewsData(q, domains, cutoff)));
+  let out = [];
+  for (const s of settled) if (s.status === 'fulfilled') out.push(...s.value);
+  out = dedupeSources(out).sort((a, b) => {
+    if (a.withinWindow && !b.withinWindow) return -1;
+    if (!a.withinWindow && b.withinWindow) return 1;
+    return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+  }).slice(0, 12);
+  preferredCache.set(cacheKey, { at: Date.now(), data: out });
+  return out;
+}
+
+
+/* =========================================================================
    RESILIENCE & CONCURRENCY (optimization)
    - Content-addressed audio cache: identical (voice, text) is synthesized
      once and then reused forever — never re-bills ElevenLabs for the same
@@ -1102,11 +1238,18 @@ function sourcesBlock(sources) {
   return out;
 }
 
-async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) {
+async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, preferredLabels) {
   const targetWords = Math.round(lengthMin * 160);
   const dateCtx = currentDateContext();
   // Sort sources by quality score so Reuters/AP/BBC lead
   const sortedSources = (sources || []).slice().sort((a, b) => sourceQualityScore(b) - sourceQualityScore(a));
+  // Preferred-outlet attribution instruction (only when the user picked outlets)
+  const preferredBlock = (preferredLabels && preferredLabels.length)
+    ? ('\n\nPREFERRED OUTLETS: The listener specifically trusts these outlets: ' + preferredLabels.join(', ') + '. '
+      + 'When a story is grounded in their reporting — i.e. the source item below is actually from one of them — attribute it to them by name in a natural spoken way ("The Journal reports…", "According to Bloomberg\'s reporting…"). '
+      + 'NEVER fabricate attribution: only credit an outlet for facts that genuinely come from ITS article in the source material below. '
+      + 'If a preferred outlet has nothing on a story, report it normally from whatever sources are available — do not force their name onto a story they did not report.\n')
+    : '';
   // Determine time-of-day greeting from UTC hour
   const hour = new Date().getUTCHours();
   const greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
@@ -1137,6 +1280,7 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) 
     '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n\n' +
     'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S&P 500 rose 0.8% to close at 5,432, the Dow gained 180 points, and the NASDAQ slipped 0.3%." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
     'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112-98 last night, improving to 41-28 on the season, while Boston falls to 45-24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
+    preferredBlock +
     'STYLE & VOICE:\n' +
     '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
     '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
@@ -1585,16 +1729,20 @@ async function generateEpisodeSegments(ep, scriptText) {
    REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
    ========================================================================= */
 async function buildBriefEpisode(user, cfg, opts) {
-  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'dave' } = cfg || {};
+  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = cfg || {};
   const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
+  // Resolve preferred publisher ids (unknown ids ignored silently — forward-compat)
+  const prefIds = (preferredSources || []).map(String).filter(pid => PUBLISHERS_BY_ID[pid]).slice(0, 12);
+  const hasPreferred = prefIds.length > 0;
 
   // Track popularity for shared, topic-free combos (used by the 12h pre-cache job)
   trackComboPopularity(cleanChannels, cleanTopics, lengthMin);
 
   // Serve from the 12h pre-generated cache if this exact shared combo was
   // already built recently — instant response instead of ~60s live generation.
-  if (!cleanTopics.length && cleanChannels.length) {
+  // Preferred-source briefs are personalized, so they never use the shared cache.
+  if (!cleanTopics.length && cleanChannels.length && !hasPreferred) {
     const cachedEp = getCachedPopularEpisode(cleanChannels, lengthMin);
     if (cachedEp) {
       console.log('popular combo cache HIT:', comboKey(cleanChannels, lengthMin));
@@ -1616,19 +1764,33 @@ async function buildBriefEpisode(user, cfg, opts) {
     id: epId, mode: 'brief', userId: user.id, status: 'generating',
     title: 'Your Brief — ' + new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
     topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId,
+    preferredSources: prefIds,
     segments: [], sources: [], createdAt: now(),
   };
   await store.saveEpisode(ep);
   const run = (async () => {
     try {
       ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
+      // Preferred-source pass (additive). Lead with trusted outlets' reporting.
+      // Any failure/empty result leaves the normal sources untouched.
+      let preferredLabels = [];
+      if (hasPreferred) {
+        preferredLabels = prefIds.map(pid => (PUBLISHERS_BY_ID[pid] || {}).label).filter(Boolean);
+        try {
+          const preferred = await fetchPreferredSources(sectionLabels, prefIds, window);
+          if (preferred.length) {
+            await Promise.all(preferred.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
+            ep.sources = dedupeSources([...preferred, ...ep.sources]).slice(0, 40);
+          }
+        } catch (e) { console.log('preferred-source pass failed (continuing):', e.message); }
+      }
       await store.updateEpisode(ep);
-      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId);
+      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId, preferredLabels);
       await generateEpisodeSegments(ep, script);
       await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
       // Populate the popular-combo cache for shared, topic-free combos so the
       // next user requesting the same combo gets an instant cached result.
-      if (!cleanTopics.length && cleanChannels.length && ep.status === 'ready') {
+      if (!cleanTopics.length && cleanChannels.length && !hasPreferred && ep.status === 'ready') {
         popularComboCache.set(comboKey(cleanChannels, lengthMin), { at: Date.now(), episode: ep });
       }
     } catch (e) {
@@ -1706,7 +1868,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.21', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.22', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1742,6 +1904,10 @@ app.get('/api/voices', (req, res) => {
 // ids in the `channels` array of POST /api/brief.
 app.get('/api/channels', (req, res) => {
   res.json({ channels: Object.entries(CHANNELS).map(([id, c]) => ({ id, label: c.label })) });
+});
+
+app.get('/api/publishers', (req, res) => {
+  res.json({ publishers: PUBLISHERS.map(p => ({ id: p.id, label: p.label, domain: p.domain, category: p.category })) });
 });
 
 /* ----- accounts --------------------------------------------------------- */
@@ -1865,7 +2031,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
 app.post('/api/brief', async (req, res) => {
-  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'dave' } = req.body || {};
+  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = req.body || {};
   const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
   if (!cleanTopics.length && !cleanChannels.length) return res.status(400).json({ error: 'Add at least one topic or channel.' });
@@ -1877,7 +2043,7 @@ app.post('/api/brief', async (req, res) => {
   if (!(await reserveGeneration(user, 1)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
 
-  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId });
+  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId, preferredSources: Array.isArray(preferredSources) ? preferredSources : [] });
   res.json({ episodeId: ep.id, status: ep.status });
 });
 
@@ -2180,7 +2346,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.21 on port ' + PORT
+        console.log('MyCast v9.22 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
