@@ -1492,14 +1492,14 @@ async function generateEpisodeSegments(ep, scriptText) {
   const cleanScript = String(scriptText || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
   // Short first segment (~35 words) so the FIRST audio chunk synthesizes fast
   // and playback can start sooner; the rest pack normally (~200 words).
+  // NOTE: synthesis is intentionally SEQUENTIAL (one chunk at a time). Parallel
+  // synthesis was tried and reverted — concurrent ElevenLabs calls triggered
+  // errors that aborted the run and truncated episodes. Do not parallelize here
+  // without a way to load-test against the live TTS provider.
   const parts = splitIntoSegments(cleanScript, 200, 35);
   ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
   await store.updateEpisode(ep);
-
-  let fatal = false;
-  // Synthesize one segment, updating + persisting as it finishes. Never throws.
-  const synthOne = async (i) => {
-    if (fatal) { ep.segments[i].status = 'failed'; ep.segments[i].error = 'aborted'; await store.updateEpisode(ep); return; }
+  for (let i = 0; i < parts.length; i++) {
     try {
       const { url } = await synthesizeToFile(parts[i], ep.voiceId);
       ep.segments[i].status = 'ready';
@@ -1512,27 +1512,18 @@ async function generateEpisodeSegments(ep, scriptText) {
       ep.error = cls.label;          // top-level reason the app can show
       ep.errorCode = cls.code;       // machine-readable: tts_quota | tts_auth | tts_rate | tts_error
       console.log('segment synth failed [' + cls.code + ']:', e.message);
-      if (cls.fatal) fatal = true;   // bad key / no credits won't fix itself — stop launching more
+      if (cls.fatal) {
+        // bad key / no credits won't fix itself across segments — stop now
+        for (let j = i + 1; j < parts.length; j++) {
+          ep.segments[j].status = 'failed';
+          ep.segments[j].error = 'aborted: ' + cls.code;
+        }
+        await store.updateEpisode(ep);
+        break;
+      }
     }
     await store.updateEpisode(ep); // persist progress segment-by-segment
-  };
-
-  // Chunk 1 first (fast, short) so the player can start immediately, then the
-  // remaining chunks run concurrently (bounded by ttsLimit) so the whole
-  // episode finishes ~2-3x faster than the old one-at-a-time loop.
-  if (parts.length) await synthOne(0);
-  if (!fatal && parts.length > 1) {
-    await Promise.all(parts.slice(1).map((_, k) => ttsLimit(() => synthOne(k + 1))));
   }
-  // If a fatal error surfaced mid-run, mark any still-pending segments failed.
-  if (fatal) {
-    let changed = false;
-    for (const seg of ep.segments) {
-      if (seg.status === 'pending') { seg.status = 'failed'; seg.error = seg.error || ('aborted: ' + (ep.errorCode || 'tts_error')); changed = true; }
-    }
-    if (changed) await store.updateEpisode(ep);
-  }
-
   const anyReady = ep.segments.some(s => s.status === 'ready');
   const allReady = ep.segments.every(s => s.status === 'ready');
   ep.status = allReady ? 'complete' : (anyReady ? 'partial' : 'failed');
@@ -1665,7 +1656,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.18', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.19', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2139,7 +2130,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.18 on port ' + PORT
+        console.log('MyCast v9.19 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
