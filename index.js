@@ -410,12 +410,34 @@ function hostnameOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
 }
 
-// Rank sources by outlet quality so wire services lead the writer's context.
-// Tier 3: Reuters / AP / BBC. Tier 2: Bloomberg / FT / WSJ / ESPN. Else 1.
+// Map a feed URL to the outlet name the script should cite ("NPR reports...").
+function publisherFromFeedUrl(url) {
+  const h = hostnameOf(url).toLowerCase();
+  if (h.includes('bbci.co.uk') || h.includes('bbc.')) return 'BBC News';
+  if (h.includes('nytimes.com')) return 'The New York Times';
+  if (h.includes('npr.org')) return 'NPR';
+  if (h.includes('theguardian.com')) return 'The Guardian';
+  if (h.includes('aljazeera.com')) return 'Al Jazeera';
+  if (h.includes('espn.com')) return 'ESPN';
+  if (h.includes('thehill.com')) return 'The Hill';
+  if (h.includes('politico.com')) return 'Politico';
+  if (h.includes('arstechnica.com')) return 'Ars Technica';
+  if (h.includes('theverge.com')) return 'The Verge';
+  if (h.includes('techcrunch.com')) return 'TechCrunch';
+  if (h.includes('sciencedaily.com')) return 'ScienceDaily';
+  if (h.includes('dj.com') || h.includes('wsj.com')) return 'The Wall Street Journal';
+  if (h.includes('reuters')) return 'Reuters';
+  if (h.includes('apnews') || h.includes('ap-')) return 'Associated Press';
+  return 'the newswires';
+}
+
+// Rank sources by outlet quality so wire services / major papers lead context.
+// Tier 3: Reuters / AP / BBC / NYT / NPR / Guardian / PBS.
+// Tier 2: Bloomberg / FT / WSJ / ESPN / The Hill / Politico / Ars / Verge / TechCrunch.
 function sourceQualityScore(s) {
   const hay = (((s && s.publisher) || '') + ' ' + ((s && s.url) ? hostnameOf(s.url) : '')).toLowerCase();
-  if (/reuters|associated press|ap news|apnews|bbc/.test(hay)) return 3;
-  if (/bloomberg|financial times|ft\.com|wall street journal|wsj|espn/.test(hay)) return 2;
+  if (/reuters|associated press|ap news|apnews|bbc|new york times|nytimes|\bnpr\b|guardian|\bpbs\b/.test(hay)) return 3;
+  if (/bloomberg|financial times|ft\.com|wall street journal|wsj|\bdj\.com\b|espn|the hill|thehill|politico|ars technica|arstechnica|the verge|theverge|techcrunch|al jazeera|aljazeera|sciencedaily/.test(hay)) return 2;
   return 1;
 }
 
@@ -524,46 +546,76 @@ async function fromGoogleNews(topic, cutoff) {
 
 /* ---- Premium RSS feeds: AP, Reuters, BBC (free, no key, high quality) ---- */
 const PREMIUM_RSS_FEEDS = {
+  // Vetted public RSS feeds. US-primary, with a few global outlets on world.
+  // Per-feed failures are caught in fromPremiumRSS, so a dead feed is skipped.
   world: [
     'https://feeds.bbci.co.uk/news/world/rss.xml',
-    'https://rss.app/feeds/AP-world-news.xml',
-    'https://feeds.reuters.com/reuters/worldNews',
-  ],
-  technology: [
-    'https://feeds.bbci.co.uk/news/technology/rss.xml',
-    'https://rss.app/feeds/AP-technology.xml',
-  ],
-  business: [
-    'https://feeds.bbci.co.uk/news/business/rss.xml',
-    'https://feeds.reuters.com/reuters/businessNews',
-  ],
-  health: [
-    'https://feeds.bbci.co.uk/news/health/rss.xml',
-    'https://rss.app/feeds/AP-health.xml',
-  ],
-  science: [
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    'https://rss.app/feeds/AP-science.xml',
+    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
+    'https://feeds.npr.org/1004/rss.xml',
+    'https://www.theguardian.com/world/rss',
+    'https://www.aljazeera.com/xml/rss/all.xml',
   ],
   politics: [
+    'https://feeds.npr.org/1014/rss.xml',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',
+    'https://thehill.com/homenews/feed/',
     'https://feeds.bbci.co.uk/news/politics/rss.xml',
-    'https://rss.app/feeds/AP-politics.xml',
+  ],
+  technology: [
+    'https://feeds.arstechnica.com/arstechnica/index/',
+    'https://www.theverge.com/rss/index.xml',
+    'https://techcrunch.com/feed/',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml',
+    'https://feeds.bbci.co.uk/news/technology/rss.xml',
+  ],
+  business: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
+    'https://feeds.bbci.co.uk/news/business/rss.xml',
+    'https://feeds.npr.org/1006/rss.xml',
+    'https://www.theguardian.com/business/rss',
+  ],
+  health: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Health.xml',
+    'https://feeds.bbci.co.uk/news/health/rss.xml',
+    'https://feeds.npr.org/1128/rss.xml',
+  ],
+  science: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Science.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://www.sciencedaily.com/rss/all.xml',
+    'https://feeds.npr.org/1007/rss.xml',
+  ],
+  sports: [
+    'https://www.espn.com/espn/rss/news',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml',
+    'https://feeds.bbci.co.uk/sport/rss.xml',
+    'https://www.theguardian.com/sport/rss',
   ],
   entertainment: [
     'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml',
+    'https://www.theguardian.com/culture/rss',
+  ],
+  climate: [
+    'https://www.theguardian.com/environment/climate-crisis/rss',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Climate.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
   ],
 };
 
-// Channel ID -> feed list mapping
+// Channel ID -> feed list. Keys MUST match the ids in CHANNELS above, or the
+// channel silently falls back to world news (the bug that made Sports empty).
 const CHANNEL_RSS_MAP = {
-  world: PREMIUM_RSS_FEEDS.world,
-  politics: PREMIUM_RSS_FEEDS.politics,
+  world_news: PREMIUM_RSS_FEEDS.world,
+  us_politics: PREMIUM_RSS_FEEDS.politics,
   technology: PREMIUM_RSS_FEEDS.technology,
-  markets: PREMIUM_RSS_FEEDS.business,
+  markets_finance: PREMIUM_RSS_FEEDS.business,
   business: PREMIUM_RSS_FEEDS.business,
   science: PREMIUM_RSS_FEEDS.science,
   health: PREMIUM_RSS_FEEDS.health,
+  sports: PREMIUM_RSS_FEEDS.sports,
   entertainment: PREMIUM_RSS_FEEDS.entertainment,
+  climate: PREMIUM_RSS_FEEDS.climate,
 };
 
 async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
@@ -578,10 +630,8 @@ async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
       for (const item of feed.items || []) {
         const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
         if (isNaN(ts) || ts < fallbackCutoff) continue;
-        // Determine publisher from feed URL
-        let publisher = 'BBC News';
-        if (feedUrl.includes('reuters')) publisher = 'Reuters';
-        else if (feedUrl.includes('AP') || feedUrl.includes('ap-')) publisher = 'Associated Press';
+        // Determine publisher from feed URL host
+        const publisher = publisherFromFeedUrl(feedUrl);
         out.push({
           topic: channelIdOrTopic,
           publisher,
@@ -1656,7 +1706,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.20', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.21', mock: MOCK_MODE, db: USE_DB }));
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2130,7 +2180,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.20 on port ' + PORT
+        console.log('MyCast v9.21 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
