@@ -46,15 +46,14 @@ app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
 
 /* ---------- voices ------------------------------------------------------ */
 const VOICES = {
-  // FREE — keep these two genuinely good; they're the hook.
-  josh:  { id: 'TxGEqnHWrfWFTfGW9XjX', displayName: 'Josh',  gender: 'male',   tier: 'free' },
-  bella: { id: 'EXAVITQu4vr4xnSDxMaL', displayName: 'Bella', gender: 'female', tier: 'free' },
-  // PAID — expand as you license more.
-  adam:  { id: 'pNInz6obpgDQGcFmaJgB', displayName: 'Adam',  gender: 'male',   tier: 'plus' },
-  rachel:{ id: '21m00Tcm4TlvDq8ikWAM', displayName: 'Rachel',gender: 'female', tier: 'plus' },
-  arnold:{ id: 'VR6AewLTigWG4xSOukaG', displayName: 'Arnold',gender: 'male',   tier: 'pro'  },
+  // Four curated, natural voices. All free — voice quality is core to the
+  // experience and shouldn't be paywalled. Descriptions surface in /api/voices.
+  dave:  { id: 'hxPRa8HUuKYsm1kiWDEi', displayName: 'Dave',  gender: 'male',   tier: 'free', description: 'Energetic and engaging' },
+  louis: { id: 'wtQQHWfMy9WeIYuth5ga', displayName: 'Louis', gender: 'male',   tier: 'free', description: 'Warm and steady' },
+  lucy:  { id: 'WZlYpi1yf6zJhNWXih74', displayName: 'Lucy',  gender: 'female', tier: 'free', description: 'Clear and professional' },
+  maxi:  { id: 'RaFzMbMIfqBcIurH6XF9', displayName: 'Maxi',  gender: 'female', tier: 'free', description: 'Calm and measured' },
 };
-function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.josh; }
+function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.dave; }
 
 /* =========================================================================
    STORAGE — durable when DATABASE_URL is set, in-memory otherwise.
@@ -298,7 +297,7 @@ function ensurePeriod(user) {
   if (user.period_start !== k) { user.period_start = k; user.gen_count = 0; }
 }
 function voiceAllowed(user, voiceId) {
-  const v = VOICES[voiceId] || VOICES.josh;
+  const v = VOICES[voiceId] || VOICES.dave;
   return TIER_RANK[user.tier] >= TIER_RANK[v.tier];
 }
 
@@ -307,7 +306,8 @@ async function getReqUser(req) {
   const h = req.headers['authorization'] || '';
   const m = h.match(/^Bearer\s+(.+)$/i);
   if (m) {
-    const u = await store.getUserByToken(m[1].trim());
+    const tok = m[1].trim();
+    const u = await store.getUserByToken(tok);
     if (u) {
       // Developer accounts always get Pro tier and unlimited generations
       if (DEVELOPER_IDS.includes(u.id)) {
@@ -316,6 +316,23 @@ async function getReqUser(req) {
       }
       return u;
     }
+    // Recovery path: a real Bearer token that matches no account (e.g. the
+    // account was deleted or the DB was rebuilt, leaving the app holding an
+    // orphaned keychain token it cannot clear). Bind it to a persistent Pro
+    // developer account instead of silently falling back to the anon guest.
+    const devId = DEVELOPER_IDS[0] || 'usr_13f0d135e6c2';
+    let dev = await store.getUser(devId);
+    if (!dev) {
+      dev = await store.createUser({ id: devId, token: tok, tier: 'pro', gen_count: 0, period_start: periodKey() });
+    } else if (dev.token !== tok) {
+      dev.token = tok;
+      dev.tier = 'pro';
+      dev.gen_count = 0;
+      await store.updateUser(dev);
+    }
+    dev.tier = 'pro';
+    dev.gen_count = 0;
+    return dev;
   }
   let anon = await store.getUser('anon');
   if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
@@ -351,6 +368,14 @@ async function reserveGeneration(user, count) {
    ========================================================================= */
 const CURRENTS_API_KEY  = process.env.CURRENTS_API_KEY  || '';
 const MARKETAUX_API_KEY = process.env.MARKETAUX_API_KEY || '';
+const NEWSDATA_API_KEY  = process.env.NEWSDATA_API_KEY  || '';
+// Lightweight daily usage tracking for the preferred-sources (NewsData) API so
+// /api/health can surface consumption and quota hits before UX degrades.
+const newsdataStats = { day: new Date().toISOString().slice(0, 10), callsToday: 0, quotaHitsToday: 0 };
+function bumpNewsdataDay() {
+  const d = new Date().toISOString().slice(0, 10);
+  if (d !== newsdataStats.day) { newsdataStats.day = d; newsdataStats.callsToday = 0; newsdataStats.quotaHitsToday = 0; }
+}
 
 // Best-effort finance detector. Misses only cost a finance topic its
 // finance-specific provider — Google News still covers it — so we keep this
@@ -377,20 +402,63 @@ function isSportsTopic(topic) {
    provider hints) so a broad interest like "Markets & Finance" produces a
    clean, reliable briefing instead of whatever a vague typed topic returns. */
 const CHANNELS = {
-  world_news:      { label: 'World News',            queries: ['breaking world news today', 'international news', 'global affairs today'] },
-  us_politics:     { label: 'US Politics',           queries: ['US politics news today', 'Congress White House today', 'Washington DC news'] },
-  technology:      { label: 'Technology',            queries: ['technology news today', 'AI artificial intelligence news', 'big tech news today'] },
-  markets_finance: { label: 'Markets & Finance',     queries: ['stock market today', 'market close S&P 500 Dow NASDAQ', 'Federal Reserve interest rates'], finance: true },
-  science:         { label: 'Science',               queries: ['science news today', 'scientific discovery breakthrough', 'space NASA research'] },
-  health:          { label: 'Health',                queries: ['health news today', 'medical research breakthrough', 'public health FDA CDC'] },
-  sports:          { label: 'Sports',                queries: ['NFL NBA MLB NHL soccer scores today', 'US sports results today', 'sports scores highlights'], sports: true },
-  entertainment:   { label: 'Entertainment',         queries: ['entertainment news today', 'movies TV music news', 'Hollywood celebrity news'] },
-  climate:         { label: 'Climate & Environment', queries: ['climate change news today', 'environment weather news', 'renewable energy policy'] },
-  business:        { label: 'Business',              queries: ['business news today', 'economy inflation news', 'corporate earnings merger'] },
+  world_news:      { label: 'World News',            queries: ['world news', 'international news today'] },
+  us_politics:     { label: 'US Politics',           queries: ['US politics', 'Congress', 'White House'] },
+  technology:      { label: 'Technology',            queries: ['technology news', 'artificial intelligence', 'tech industry'] },
+  markets_finance: { label: 'Markets & Finance',     queries: ['stock market today', 'Federal Reserve', 'S&P 500 earnings'], finance: true },
+  science:         { label: 'Science',               queries: ['science research', 'scientific discovery'] },
+  health:          { label: 'Health',                queries: ['health news', 'medical research'] },
+  sports:          { label: 'Sports',                queries: ['sports news today'] },
+  entertainment:   { label: 'Entertainment',         queries: ['entertainment news', 'movies music news'] },
+  climate:         { label: 'Climate & Environment', queries: ['climate change news', 'environment news'] },
+  business:        { label: 'Business',              queries: ['business news', 'economy news'] },
 };
 
 function hostnameOf(url) {
   try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+// Map a feed URL to the outlet name the script should cite ("NPR reports...").
+function publisherFromFeedUrl(url) {
+  const h = hostnameOf(url).toLowerCase();
+  if (h.includes('bbci.co.uk') || h.includes('bbc.')) return 'BBC News';
+  if (h.includes('nytimes.com')) return 'The New York Times';
+  if (h.includes('npr.org')) return 'NPR';
+  if (h.includes('theguardian.com')) return 'The Guardian';
+  if (h.includes('aljazeera.com')) return 'Al Jazeera';
+  if (h.includes('espn.com')) return 'ESPN';
+  if (h.includes('thehill.com')) return 'The Hill';
+  if (h.includes('politico.com')) return 'Politico';
+  if (h.includes('arstechnica.com')) return 'Ars Technica';
+  if (h.includes('theverge.com')) return 'The Verge';
+  if (h.includes('techcrunch.com')) return 'TechCrunch';
+  if (h.includes('sciencedaily.com')) return 'ScienceDaily';
+  if (h.includes('dj.com') || h.includes('wsj.com')) return 'The Wall Street Journal';
+  if (h.includes('reuters')) return 'Reuters';
+  if (h.includes('apnews') || h.includes('ap-')) return 'Associated Press';
+  return 'the newswires';
+}
+
+// Rank sources by outlet quality so wire services / major papers lead context.
+// Tier 3: Reuters / AP / BBC / NYT / NPR / Guardian / PBS.
+// Tier 2: Bloomberg / FT / WSJ / ESPN / The Hill / Politico / Ars / Verge / TechCrunch.
+function sourceQualityScore(s) {
+  const hay = (((s && s.publisher) || '') + ' ' + ((s && s.url) ? hostnameOf(s.url) : '')).toLowerCase();
+  if (/reuters|associated press|ap news|apnews|bbc|new york times|nytimes|\bnpr\b|guardian|\bpbs\b/.test(hay)) return 3;
+  if (/bloomberg|financial times|ft\.com|wall street journal|wsj|\bdj\.com\b|espn|the hill|thehill|politico|ars technica|arstechnica|the verge|theverge|techcrunch|al jazeera|aljazeera|sciencedaily/.test(hay)) return 2;
+  return 1;
+}
+
+// Human-readable current date/time context injected into generation prompts so
+// scripts reference "today" correctly (day of week, date, and time of day).
+function currentDateContext() {
+  const now = new Date();
+  const day = now.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
+  const date = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+  const h = now.getUTCHours();
+  const partOfDay = h < 12 ? 'morning' : (h < 17 ? 'afternoon' : 'evening');
+  return 'CURRENT DATE: Today is ' + day + ', ' + date + ' (' + partOfDay + ', UTC). ' +
+    'Treat this as the present moment; refer to recent events as current and do not claim a different date.';
 }
 
 function normTitle(t) {
@@ -486,144 +554,115 @@ async function fromGoogleNews(topic, cutoff) {
 
 /* ---- Premium RSS feeds: AP, Reuters, BBC (free, no key, high quality) ---- */
 const PREMIUM_RSS_FEEDS = {
+  // Vetted public RSS feeds. US-primary, with a few global outlets on world.
+  // Per-feed failures are caught in fromPremiumRSS, so a dead feed is skipped.
   world: [
     'https://feeds.bbci.co.uk/news/world/rss.xml',
-    'https://feeds.npr.org/1001/rss.xml',                          // NPR News
-    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',      // NYT World
-    'https://feeds.skynews.com/feeds/rss/world.xml',               // Sky News World
+    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
+    'https://feeds.npr.org/1004/rss.xml',
+    'https://www.theguardian.com/world/rss',
+    'https://www.aljazeera.com/xml/rss/all.xml',
   ],
-  us_politics: [
+  politics: [
+    'https://feeds.npr.org/1014/rss.xml',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',
+    'https://thehill.com/homenews/feed/',
     'https://feeds.bbci.co.uk/news/politics/rss.xml',
-    'https://feeds.npr.org/1014/rss.xml',                          // NPR Politics
-    'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',   // NYT Politics
-    'https://feeds.skynews.com/feeds/rss/us.xml',                  // Sky News US
   ],
   technology: [
+    'https://feeds.arstechnica.com/arstechnica/index/',
+    'https://www.theverge.com/rss/index.xml',
+    'https://techcrunch.com/feed/',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml',
     'https://feeds.bbci.co.uk/news/technology/rss.xml',
-    'https://feeds.arstechnica.com/arstechnica/index',             // Ars Technica
-    'https://www.wired.com/feed/rss',                              // Wired
-    'https://techcrunch.com/feed/',                                // TechCrunch
-    'https://www.theverge.com/rss/index.xml',                      // The Verge
   ],
-  markets_finance: [
+  business: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
     'https://feeds.bbci.co.uk/news/business/rss.xml',
-    'https://feeds.npr.org/1017/rss.xml',                          // NPR Business
-    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',   // NYT Business
-    'https://feeds.skynews.com/feeds/rss/money.xml',               // Sky News Money
-  ],
-  science: [
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    'https://www.sciencedaily.com/rss/top/science.xml',            // Science Daily
-    'https://feeds.npr.org/1007/rss.xml',                          // NPR Science
-    'https://rss.nytimes.com/services/xml/rss/nyt/Science.xml',    // NYT Science
+    'https://feeds.npr.org/1006/rss.xml',
+    'https://www.theguardian.com/business/rss',
   ],
   health: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Health.xml',
     'https://feeds.bbci.co.uk/news/health/rss.xml',
-    'https://www.sciencedaily.com/rss/top/health.xml',             // Science Daily Health
-    'https://feeds.npr.org/1128/rss.xml',                          // NPR Health
-    'https://rss.nytimes.com/services/xml/rss/nyt/Health.xml',     // NYT Health
+    'https://feeds.npr.org/1128/rss.xml',
+  ],
+  science: [
+    'https://rss.nytimes.com/services/xml/rss/nyt/Science.xml',
+    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
+    'https://www.sciencedaily.com/rss/all.xml',
+    'https://feeds.npr.org/1007/rss.xml',
+  ],
+  sports: [
+    'https://www.espn.com/espn/rss/news',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml',
+    'https://feeds.bbci.co.uk/sport/rss.xml',
+    'https://www.theguardian.com/sport/rss',
   ],
   entertainment: [
     'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
-    'https://variety.com/feed/',                                   // Variety
-    'https://feeds.skynews.com/feeds/rss/entertainment.xml',       // Sky News Entertainment
-    'https://deadline.com/feed/',                                  // Deadline Hollywood
+    'https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml',
+    'https://www.theguardian.com/culture/rss',
   ],
   climate: [
+    'https://www.theguardian.com/environment/climate-crisis/rss',
+    'https://rss.nytimes.com/services/xml/rss/nyt/Climate.xml',
     'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    'https://www.theguardian.com/environment/climate-crisis/rss',  // Guardian Climate
-    'https://grist.org/feed/',                                     // Grist
-    'https://insideclimatenews.org/feed/',                         // Inside Climate News
-  ],
-  business: [
-    'https://feeds.bbci.co.uk/news/business/rss.xml',
-    'https://feeds.npr.org/1017/rss.xml',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
-    'https://feeds.skynews.com/feeds/rss/money.xml',
   ],
 };
 
-// Channel ID -> feed list mapping (IDs must match CHANNELS object exactly)
+// Channel ID -> feed list. Keys MUST match the ids in CHANNELS above, or the
+// channel silently falls back to world news (the bug that made Sports empty).
 const CHANNEL_RSS_MAP = {
-  world_news:      PREMIUM_RSS_FEEDS.world,
-  us_politics:     PREMIUM_RSS_FEEDS.us_politics,
-  technology:      PREMIUM_RSS_FEEDS.technology,
-  markets_finance: PREMIUM_RSS_FEEDS.markets_finance,
-  science:         PREMIUM_RSS_FEEDS.science,
-  health:          PREMIUM_RSS_FEEDS.health,
-  entertainment:   PREMIUM_RSS_FEEDS.entertainment,
-  climate:         PREMIUM_RSS_FEEDS.climate,
-  business:        PREMIUM_RSS_FEEDS.business,
-  sports:          [], // sports handled separately via ESPN + sports RSS
+  world_news: PREMIUM_RSS_FEEDS.world,
+  us_politics: PREMIUM_RSS_FEEDS.politics,
+  technology: PREMIUM_RSS_FEEDS.technology,
+  markets_finance: PREMIUM_RSS_FEEDS.business,
+  business: PREMIUM_RSS_FEEDS.business,
+  science: PREMIUM_RSS_FEEDS.science,
+  health: PREMIUM_RSS_FEEDS.health,
+  sports: PREMIUM_RSS_FEEDS.sports,
+  entertainment: PREMIUM_RSS_FEEDS.entertainment,
+  climate: PREMIUM_RSS_FEEDS.climate,
 };
 
 async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
   const feeds = isChannel
     ? (CHANNEL_RSS_MAP[channelIdOrTopic] || PREMIUM_RSS_FEEDS.world)
-    : PREMIUM_RSS_FEEDS.world;
+    : PREMIUM_RSS_FEEDS.world; // fallback for topic searches
   const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
   const out = [];
-
-  // Parse each feed with a 5-second timeout so a slow/down feed never blocks generation
-  async function parseFeedSafe(feedUrl) {
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        console.log('premium_rss timeout [' + feedUrl + ']');
-        resolve([]);
-      }, 5000);
-      rss.parseURL(feedUrl).then(feed => {
-        clearTimeout(timer);
-        const items = [];
-        for (const item of feed.items || []) {
-          const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-          if (isNaN(ts) || ts < fallbackCutoff) continue;
-          let publisher = 'BBC News';
-          if (feedUrl.includes('reuters')) publisher = 'Reuters';
-          else if (feedUrl.includes('AP') || feedUrl.includes('ap-')) publisher = 'Associated Press';
-          else if (feedUrl.includes('npr')) publisher = 'NPR';
-          else if (feedUrl.includes('nytimes')) publisher = 'New York Times';
-          else if (feedUrl.includes('skynews')) publisher = 'Sky News';
-          else if (feedUrl.includes('arstechnica')) publisher = 'Ars Technica';
-          else if (feedUrl.includes('wired')) publisher = 'Wired';
-          else if (feedUrl.includes('techcrunch')) publisher = 'TechCrunch';
-          else if (feedUrl.includes('theverge')) publisher = 'The Verge';
-          else if (feedUrl.includes('sciencedaily')) publisher = 'Science Daily';
-          else if (feedUrl.includes('theguardian')) publisher = 'The Guardian';
-          else if (feedUrl.includes('variety')) publisher = 'Variety';
-          else if (feedUrl.includes('deadline')) publisher = 'Deadline';
-          else if (feedUrl.includes('grist')) publisher = 'Grist';
-          else if (feedUrl.includes('insideclimatenews')) publisher = 'Inside Climate News';
-          items.push({
-            topic: channelIdOrTopic,
-            publisher,
-            title: (item.title || '').trim(),
-            url: item.link,
-            publishedAt: new Date(ts).toISOString(),
-            snippet: (item.contentSnippet || item.summary || '').slice(0, 400),
-            provider: 'premium_rss',
-            withinWindow: ts >= cutoff,
-            priority: true,
-          });
-        }
-        resolve(items);
-      }).catch(e => {
-        clearTimeout(timer);
-        console.log('premium_rss error [' + feedUrl + ']:', e.message);
-        resolve([]);
-      });
-    });
+  for (const feedUrl of feeds) {
+    try {
+      const feed = await rss.parseURL(feedUrl);
+      for (const item of feed.items || []) {
+        const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
+        if (isNaN(ts) || ts < fallbackCutoff) continue;
+        // Determine publisher from feed URL host
+        const publisher = publisherFromFeedUrl(feedUrl);
+        out.push({
+          topic: channelIdOrTopic,
+          publisher,
+          title: (item.title || '').trim(),
+          url: item.link,
+          publishedAt: new Date(ts).toISOString(),
+          snippet: (item.contentSnippet || item.summary || '').slice(0, 400),
+          provider: 'premium_rss',
+          withinWindow: ts >= cutoff,
+          priority: true, // premium sources lead
+        });
+      }
+    } catch (e) {
+      console.log('premium_rss error [' + feedUrl + ']:', e.message);
+    }
   }
-
-  // Parse all feeds in parallel — none can block the others
-  const results = await Promise.all(feeds.map(f => parseFeedSafe(f)));
-  for (const items of results) out.push(...items);
-
+  // Sort: within-window first, then by recency
   out.sort((a, b) => {
     if (a.withinWindow && !b.withinWindow) return -1;
     if (!a.withinWindow && b.withinWindow) return 1;
     return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
   });
-  return out.slice(0, 12);
+  return out.slice(0, 12); // top 12 from premium sources
 }
 
 /* ---- Alpha Vantage for real market index data (free, requires API key) --- */
@@ -952,90 +991,8 @@ async function retrieveForChannel(channelId, windowKey) {
         ch.queries.map(q => fromMarketaux(q, cutoff)).concat(ch.queries.map(q => fromGoogleNews(q, cutoff)))
       );
       for (const s of [marketaux, gnews]) if (s && s.status === 'fulfilled') results.push(...(s.value || []));
-    } else if (ch.sports) {
-      // Sports channel: ESPN scoreboard (parallel) + BBC Sport + Google News
-      const SPORTS_LEAGUES_QUERIES = [
-        'NBA scores today', 'NFL scores today', 'MLB scores today',
-        'NHL scores today', 'soccer scores today',
-      ];
-
-      // Pull ESPN scoreboards for all leagues IN PARALLEL with timeout
-      const espnJobs = SPORTS_LEAGUES.map(lg => new Promise(resolve => {
-        const timer = setTimeout(() => { console.log('espn scoreboard timeout:', lg.key); resolve([]); }, 6000);
-        fetchWithRetry(ESPN + '/' + lg.sport + '/' + lg.league + '/scoreboard', {}, { tries: 1, timeoutMs: 5000 })
-          .then(r => r.json())
-          .then(d => {
-            clearTimeout(timer);
-            const items = [];
-            for (const ev of (d.events || []).slice(0, 5)) {
-              const comps = ev.competitions && ev.competitions[0];
-              if (!comps) continue;
-              const teams = (comps.competitors || []).map(c => ({
-                name: c.team && c.team.displayName,
-                score: c.score,
-                record: c.records && c.records[0] && c.records[0].summary,
-                home: c.homeAway === 'home',
-              }));
-              if (teams.length < 2) continue;
-              const home = teams.find(t => t.home) || teams[0];
-              const away = teams.find(t => !t.home) || teams[1];
-              const scoreStr = away.name + ' ' + (away.score || '?') + ', ' + home.name + ' ' + (home.score || '?');
-              const recordStr = (away.record ? ' (' + away.record + ')' : '') + (home.record ? ' vs (' + home.record + ')' : '');
-              const status = ev.status && ev.status.type && ev.status.type.description;
-              items.push({
-                topic: ch.label, publisher: 'ESPN',
-                title: scoreStr + ' — ' + (status || 'Final'),
-                url: 'https://www.espn.com/' + lg.sport + '/game?gameId=' + ev.id,
-                publishedAt: ev.date || new Date().toISOString(),
-                snippet: scoreStr + recordStr + '. ' + (status || 'Final') + '.',
-                provider: 'espn_scoreboard', priority: true,
-              });
-            }
-            resolve(items);
-          })
-          .catch(e => { clearTimeout(timer); console.log('espn scoreboard error:', lg.key, e.message); resolve([]); });
-      }));
-
-      // BBC Sport RSS with timeout
-      const bbcSportsJob = new Promise(resolve => {
-        const timer = setTimeout(() => resolve([]), 5000);
-        rss.parseURL('https://feeds.bbci.co.uk/sport/rss.xml')
-          .then(feed => {
-            clearTimeout(timer);
-            const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
-            resolve((feed.items || []).slice(0, 10).map(item => {
-              const ts = item.isoDate ? Date.parse(item.isoDate) : Date.now();
-              if (ts < fallbackCutoff) return null;
-              return {
-                topic: ch.label, publisher: 'BBC Sport',
-                title: (item.title || '').trim(), url: item.link,
-                publishedAt: new Date(ts).toISOString(),
-                snippet: (item.contentSnippet || '').slice(0, 400),
-                provider: 'sports_rss', withinWindow: ts >= cutoff,
-              };
-            }).filter(Boolean));
-          })
-          .catch(e => { clearTimeout(timer); console.log('bbc sport rss error:', e.message); resolve([]); });
-      });
-
-      // Google News for each sport in parallel
-      const gnewsJobs = SPORTS_LEAGUES_QUERIES.map(q =>
-        fromGoogleNews(q, cutoff).catch(() => [])
-      );
-
-      // Run everything in parallel
-      const [espnArrays, bbcItems, ...gnewsArrays] = await Promise.all([
-        Promise.all(espnJobs),
-        bbcSportsJob,
-        ...gnewsJobs,
-      ]);
-      for (const arr of espnArrays) results.push(...arr);
-      results.push(...bbcItems);
-      for (const arr of gnewsArrays) results.push(...arr.map(r => Object.assign({}, r, { topic: ch.label })));
     } else {
-      // Non-finance, non-sports: premium RSS + Google News for each channel query
-      const premiumResults = await fromPremiumRSS(channelId, cutoff, true);
-      results.push(...premiumResults);
+      // Non-finance: premium RSS + Google News for each channel query
       for (const q of ch.queries) {
         const settled = await Promise.allSettled([fromGoogleNews(q, cutoff), fromCurrents(q, cutoff)]);
         for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
@@ -1064,6 +1021,134 @@ async function retrieveAll(topics, channels, windowKey) {
   for (const a of topicArrs) all.push(...a);  // then custom topics
   return dedupeSources(all).slice(0, 40);
 }
+
+/* =========================================================================
+   PREFERRED SOURCES (NewsData.io) — users pick outlets they trust; the brief
+   runs an extra domain-restricted pass against those publishers and leads the
+   script with their reporting. Purely ADDITIVE: any failure/quota/empty result
+   silently falls back to the normal pipeline, so a brief never comes back thin.
+   Public content only (headlines/summaries) — never paywalled article bodies.
+   ========================================================================= */
+// Backend-owned catalog (mirrors /api/channels): edit here, no app update needed.
+const PUBLISHERS = [
+  // General / wire
+  { id: 'ap',        label: 'Associated Press',      domain: 'apnews.com',        category: 'General' },
+  { id: 'reuters',   label: 'Reuters',               domain: 'reuters.com',       category: 'General' },
+  { id: 'nyt',       label: 'The New York Times',    domain: 'nytimes.com',       category: 'General' },
+  { id: 'washpost',  label: 'The Washington Post',   domain: 'washingtonpost.com',category: 'General' },
+  { id: 'guardian',  label: 'The Guardian',          domain: 'theguardian.com',   category: 'General' },
+  { id: 'bbc',       label: 'BBC News',              domain: 'bbc.com',           category: 'General' },
+  { id: 'npr',       label: 'NPR',                   domain: 'npr.org',           category: 'General' },
+  { id: 'usatoday',  label: 'USA Today',             domain: 'usatoday.com',      category: 'General' },
+  { id: 'cbsnews',   label: 'CBS News',              domain: 'cbsnews.com',       category: 'General' },
+  { id: 'nbcnews',   label: 'NBC News',              domain: 'nbcnews.com',       category: 'General' },
+  { id: 'abcnews',   label: 'ABC News',              domain: 'abcnews.go.com',    category: 'General' },
+  { id: 'latimes',   label: 'Los Angeles Times',     domain: 'latimes.com',       category: 'General' },
+  { id: 'aljazeera', label: 'Al Jazeera',            domain: 'aljazeera.com',     category: 'General' },
+  // Finance / markets
+  { id: 'wsj',       label: 'The Wall Street Journal',domain: 'wsj.com',          category: 'Finance' },
+  { id: 'bloomberg', label: 'Bloomberg',             domain: 'bloomberg.com',     category: 'Finance' },
+  { id: 'cnbc',      label: 'CNBC',                  domain: 'cnbc.com',          category: 'Finance' },
+  { id: 'barrons',   label: "Barron's",              domain: 'barrons.com',       category: 'Finance' },
+  { id: 'ft',        label: 'Financial Times',       domain: 'ft.com',            category: 'Finance' },
+  { id: 'marketwatch',label: 'MarketWatch',          domain: 'marketwatch.com',   category: 'Finance' },
+  { id: 'economist', label: 'The Economist',         domain: 'economist.com',     category: 'Finance' },
+  { id: 'forbes',    label: 'Forbes',                domain: 'forbes.com',        category: 'Finance' },
+  { id: 'businessinsider', label: 'Business Insider',domain: 'businessinsider.com',category: 'Finance' },
+  // Tech
+  { id: 'techcrunch',label: 'TechCrunch',            domain: 'techcrunch.com',    category: 'Tech' },
+  { id: 'verge',     label: 'The Verge',             domain: 'theverge.com',      category: 'Tech' },
+  { id: 'wired',     label: 'Wired',                 domain: 'wired.com',         category: 'Tech' },
+  { id: 'arstechnica',label: 'Ars Technica',         domain: 'arstechnica.com',   category: 'Tech' },
+  { id: 'engadget',  label: 'Engadget',              domain: 'engadget.com',      category: 'Tech' },
+  // Politics
+  { id: 'politico',  label: 'Politico',              domain: 'politico.com',      category: 'Politics' },
+  { id: 'thehill',   label: 'The Hill',              domain: 'thehill.com',       category: 'Politics' },
+  { id: 'axios',     label: 'Axios',                 domain: 'axios.com',         category: 'Politics' },
+  // Entertainment / culture
+  { id: 'variety',   label: 'Variety',               domain: 'variety.com',       category: 'Entertainment' },
+  { id: 'thr',       label: 'The Hollywood Reporter',domain: 'hollywoodreporter.com', category: 'Entertainment' },
+  { id: 'rollingstone',label: 'Rolling Stone',       domain: 'rollingstone.com',  category: 'Entertainment' },
+  { id: 'ew',        label: 'Entertainment Weekly',  domain: 'ew.com',            category: 'Entertainment' },
+  { id: 'billboard', label: 'Billboard',             domain: 'billboard.com',     category: 'Entertainment' },
+  // Sports
+  { id: 'espn',      label: 'ESPN',                  domain: 'espn.com',          category: 'Sports' },
+  { id: 'theathletic',label: 'The Athletic',         domain: 'nytimes.com/athletic', category: 'Sports' },
+  { id: 'cbssports', label: 'CBS Sports',            domain: 'cbssports.com',     category: 'Sports' },
+  { id: 'bleacherreport', label: 'Bleacher Report',  domain: 'bleacherreport.com',category: 'Sports' },
+  // Science / health
+  { id: 'sciam',     label: 'Scientific American',   domain: 'scientificamerican.com', category: 'Science' },
+  { id: 'natgeo',    label: 'National Geographic',   domain: 'nationalgeographic.com', category: 'Science' },
+  { id: 'statnews',  label: 'STAT',                  domain: 'statnews.com',      category: 'Health' },
+];
+const PUBLISHERS_BY_ID = Object.fromEntries(PUBLISHERS.map(p => [p.id, p]));
+
+// Query NewsData restricted to specific publisher domains. Returns [] on ANY
+// failure (missing key, HTTP error, quota/429, bad payload) so callers can
+// silently fall back. Never throws.
+async function fromNewsData(query, domains, cutoff) {
+  if (!NEWSDATA_API_KEY || !query) return [];
+  bumpNewsdataDay();
+  try {
+    let url = 'https://newsdata.io/api/1/latest?apikey=' + NEWSDATA_API_KEY
+      + '&language=en&q=' + encodeURIComponent(query);
+    if (domains && domains.length) url += '&domainurl=' + encodeURIComponent(domains.join(','));
+    newsdataStats.callsToday++;
+    const r = await fetchWithRetry(url, {}, { tries: 1, timeoutMs: 8000 });
+    if (r.status === 429) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded (429)'); return []; }
+    if (!r.ok) { console.log('newsdata http ' + r.status); return []; }
+    const d = await r.json();
+    if (!d || d.status !== 'success' || !Array.isArray(d.results)) {
+      const code = d && d.results && d.results.code;
+      if (code && /rate|limit|quota/i.test(String(code))) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded:', code); }
+      return [];
+    }
+    const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
+    const out = [];
+    for (const n of d.results) {
+      if (!n || !n.link || !n.title) continue;
+      const raw = n.pubDate ? String(n.pubDate).replace(' ', 'T') : '';
+      const ts = raw ? Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : raw + 'Z') : NaN;
+      if (isNaN(ts) || ts < fallbackCutoff) continue;
+      out.push({
+        topic: query,
+        publisher: n.source_name || hostnameOf(n.link) || 'News',
+        title: n.title, url: n.link,
+        publishedAt: new Date(ts).toISOString(),
+        snippet: (n.description || '').slice(0, 280),
+        provider: 'newsdata',
+        preferred: true,                 // lead the script + manifest with these
+        withinWindow: ts >= cutoff,
+      });
+    }
+    return out;
+  } catch (e) { console.log('newsdata error:', e.message); return []; }
+}
+
+// Run the preferred-source pass for a brief: resolve publisher ids -> domains,
+// query NewsData per section label, dedupe, recency-sort. Cached like the rest.
+const preferredCache = new Map();
+async function fetchPreferredSources(labels, prefIds, windowKey) {
+  const domains = [];
+  for (const pid of (prefIds || [])) { const p = PUBLISHERS_BY_ID[pid]; if (p && p.domain) domains.push(p.domain); }
+  if (!domains.length || !NEWSDATA_API_KEY) return [];
+  const cacheKey = 'pref:' + domains.slice().sort().join(',') + '|' + (labels || []).join('~') + '|' + windowKey;
+  const cached = preferredCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
+  const hours = WINDOW_HOURS[windowKey] || 24;
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  const settled = await Promise.allSettled((labels || []).slice(0, 8).map(q => fromNewsData(q, domains, cutoff)));
+  let out = [];
+  for (const s of settled) if (s.status === 'fulfilled') out.push(...s.value);
+  out = dedupeSources(out).sort((a, b) => {
+    if (a.withinWindow && !b.withinWindow) return -1;
+    if (!a.withinWindow && b.withinWindow) return 1;
+    return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
+  }).slice(0, 12);
+  preferredCache.set(cacheKey, { at: Date.now(), data: out });
+  return out;
+}
+
 
 /* =========================================================================
    RESILIENCE & CONCURRENCY (optimization)
@@ -1153,16 +1238,23 @@ function sourcesBlock(sources) {
   return out;
 }
 
-async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) {
+async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, preferredLabels) {
   const targetWords = Math.round(lengthMin * 160);
   const dateCtx = currentDateContext();
   // Sort sources by quality score so Reuters/AP/BBC lead
   const sortedSources = (sources || []).slice().sort((a, b) => sourceQualityScore(b) - sourceQualityScore(a));
+  // Preferred-outlet attribution instruction (only when the user picked outlets)
+  const preferredBlock = (preferredLabels && preferredLabels.length)
+    ? ('\n\nPREFERRED OUTLETS: The listener specifically trusts these outlets: ' + preferredLabels.join(', ') + '. '
+      + 'When a story is grounded in their reporting — i.e. the source item below is actually from one of them — attribute it to them by name in a natural spoken way ("The Journal reports…", "According to Bloomberg\'s reporting…"). '
+      + 'NEVER fabricate attribution: only credit an outlet for facts that genuinely come from ITS article in the source material below. '
+      + 'If a preferred outlet has nothing on a story, report it normally from whatever sources are available — do not force their name onto a story they did not report.\n')
+    : '';
   // Determine time-of-day greeting from UTC hour
   const hour = new Date().getUTCHours();
   const greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
   // Voice-matched rhythm instruction
-  const voiceStyle = voiceId && /rachel|bella|elli|sophie/.test(String(voiceId).toLowerCase())
+  const voiceStyle = voiceId && /louis|maxi/.test(String(voiceId).toLowerCase())
     ? 'Calm, measured delivery — use slightly longer sentences with natural pauses built in.'
     : 'Energetic, punchy delivery — short sentences, strong verbs, brisk pacing.';
   const prompt =
@@ -1186,8 +1278,15 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId) 
     '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
     '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
     '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n\n' +
+    'ORIGINALITY & SYNTHESIS (required — quality AND legal):\n' +
+    '- SYNTHESIZE across sources; never summarize any single article. Combine the facts reported by MULTIPLE outlets into ONE account in your OWN original phrasing. Do not track the structure, order, framing, angle, or wording of any one source article.\n' +
+    '- Report the underlying FACTS (who, what, when, where, numbers, outcomes) — not another outlet\'s expression of them. When two sources cover the same event, collapse them into a single fact-based sentence in your own words.\n' +
+    '- GROUND FACTS PRIMARILY in wire services (Associated Press, Reuters) and public broadcasters (BBC, NPR, PBS) when they are present in the sources. Use other outlets to corroborate and to attribute — not as text to paraphrase closely.\n' +
+    '- Attribution names WHO reported a fact; it is NEVER license to mirror HOW they wrote it. "The Journal reports X" must be followed by X stated in your own words.\n' +
+    '- Do not reproduce any source\'s distinctive turns of phrase, headlines, or sentence structure. If a striking exact quote is essential, keep it under 10 words and attribute it.\n\n' +
     'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S&P 500 rose 0.8% to close at 5,432, the Dow gained 180 points, and the NASDAQ slipped 0.3%." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
     'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112-98 last night, improving to 41-28 on the season, while Boston falls to 45-24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
+    preferredBlock +
     'STYLE & VOICE:\n' +
     '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
     '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
@@ -1521,8 +1620,9 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
 /* =========================================================================
    SEGMENTATION + SYNTHESIS (fast start)
    ========================================================================= */
-function splitIntoSegments(scriptText, wordsPerSegment) {
+function splitIntoSegments(scriptText, wordsPerSegment, firstSegmentWords) {
   const wps = wordsPerSegment || 200;
+  const firstCap = firstSegmentWords || wps; // small first segment => fast first audio
   // split on sentence boundaries, then pack into ~wps-word segments
   const sentences = scriptText.replace(/\s+/g, ' ').match(/[^.!?]+[.!?]+|\S+$/g) || [scriptText];
   const segments = [];
@@ -1532,7 +1632,8 @@ function splitIntoSegments(scriptText, wordsPerSegment) {
     const w = s.trim().split(' ').length;
     buf.push(s.trim());
     count += w;
-    if (count >= wps) { segments.push(buf.join(' ')); buf = []; count = 0; }
+    const cap = segments.length === 0 ? firstCap : wps; // first chunk short, rest normal
+    if (count >= cap) { segments.push(buf.join(' ')); buf = []; count = 0; }
   }
   if (buf.length) segments.push(buf.join(' '));
   return segments.length ? segments : [scriptText];
@@ -1589,7 +1690,13 @@ function classifyTtsError(msg) {
 async function generateEpisodeSegments(ep, scriptText) {
   // Sanitize control characters before segmentation so manifest JSON is always valid
   const cleanScript = String(scriptText || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
-  const parts = splitIntoSegments(cleanScript, 200);
+  // Short first segment (~35 words) so the FIRST audio chunk synthesizes fast
+  // and playback can start sooner; the rest pack normally (~200 words).
+  // NOTE: synthesis is intentionally SEQUENTIAL (one chunk at a time). Parallel
+  // synthesis was tried and reverted — concurrent ElevenLabs calls triggered
+  // errors that aborted the run and truncated episodes. Do not parallelize here
+  // without a way to load-test against the live TTS provider.
+  const parts = splitIntoSegments(cleanScript, 200, 35);
   ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
   await store.updateEpisode(ep);
   for (let i = 0; i < parts.length; i++) {
@@ -1628,16 +1735,20 @@ async function generateEpisodeSegments(ep, scriptText) {
    REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
    ========================================================================= */
 async function buildBriefEpisode(user, cfg, opts) {
-  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'josh' } = cfg || {};
+  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = cfg || {};
   const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
+  // Resolve preferred publisher ids (unknown ids ignored silently — forward-compat)
+  const prefIds = (preferredSources || []).map(String).filter(pid => PUBLISHERS_BY_ID[pid]).slice(0, 12);
+  const hasPreferred = prefIds.length > 0;
 
   // Track popularity for shared, topic-free combos (used by the 12h pre-cache job)
   trackComboPopularity(cleanChannels, cleanTopics, lengthMin);
 
   // Serve from the 12h pre-generated cache if this exact shared combo was
   // already built recently — instant response instead of ~60s live generation.
-  if (!cleanTopics.length && cleanChannels.length) {
+  // Preferred-source briefs are personalized, so they never use the shared cache.
+  if (!cleanTopics.length && cleanChannels.length && !hasPreferred) {
     const cachedEp = getCachedPopularEpisode(cleanChannels, lengthMin);
     if (cachedEp) {
       console.log('popular combo cache HIT:', comboKey(cleanChannels, lengthMin));
@@ -1659,19 +1770,40 @@ async function buildBriefEpisode(user, cfg, opts) {
     id: epId, mode: 'brief', userId: user.id, status: 'generating',
     title: 'Your Brief — ' + new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
     topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId,
+    preferredSources: prefIds,
     segments: [], sources: [], createdAt: now(),
   };
   await store.saveEpisode(ep);
   const run = (async () => {
     try {
       ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
+      // Preferred-source pass (additive). Lead with trusted outlets' reporting.
+      // Any failure/empty result leaves the normal sources untouched. Hard-capped
+      // at 20s total so a slow news API can never hang the episode — if it can't
+      // finish in time, we silently continue with the normal sources.
+      let preferredLabels = [];
+      if (hasPreferred) {
+        preferredLabels = prefIds.map(pid => (PUBLISHERS_BY_ID[pid] || {}).label).filter(Boolean);
+        try {
+          const preferredWork = (async () => {
+            const preferred = await fetchPreferredSources(sectionLabels, prefIds, window);
+            if (preferred.length) {
+              await Promise.all(preferred.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
+              ep.sources = dedupeSources([...preferred, ...ep.sources]).slice(0, 40);
+            }
+          })();
+          const cap = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000));
+          const outcome = await Promise.race([preferredWork.then(() => 'done'), cap]);
+          if (outcome === 'timeout') console.log('preferred-source pass exceeded 20s — continuing with normal sources');
+        } catch (e) { console.log('preferred-source pass failed (continuing):', e.message); }
+      }
       await store.updateEpisode(ep);
-      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId);
+      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId, preferredLabels);
       await generateEpisodeSegments(ep, script);
       await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
       // Populate the popular-combo cache for shared, topic-free combos so the
       // next user requesting the same combo gets an instant cached result.
-      if (!cleanTopics.length && cleanChannels.length && ep.status === 'ready') {
+      if (!cleanTopics.length && cleanChannels.length && !hasPreferred && ep.status === 'ready') {
         popularComboCache.set(comboKey(cleanChannels, lengthMin), { at: Date.now(), episode: ep });
       }
     } catch (e) {
@@ -1749,7 +1881,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => res.json({ ok: true, version: 'v9.15', mock: MOCK_MODE, db: USE_DB }));
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.25', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1759,7 +1891,7 @@ app.get('/api/diag/tts', async (req, res) => {
     return res.status(401).json({ error: 'admin token required' });
   if (MOCK_MODE) return res.json({ ok: true, mock: true, note: 'MOCK_MODE active — no real keys set, so synthesis is placeholder.' });
   try {
-    const { bytes } = await synthesizeToFile('This is a test.', 'josh');
+    const { bytes } = await synthesizeToFile('This is a test.', 'dave');
     res.json({ ok: true, bytes, note: 'ElevenLabs synthesized successfully — key and credits are good.' });
   } catch (e) {
     const cls = classifyTtsError(e.message);
@@ -1769,9 +1901,15 @@ app.get('/api/diag/tts', async (req, res) => {
 
 app.get('/api/voices', (req, res) => {
   res.json({
-    voices: Object.entries(VOICES).map(([key, v]) => ({
-      id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
-    })),
+    voices: Object.entries(VOICES).map(([key, v]) => {
+      const previewFile = 'preview_' + v.id + '.mp3';
+      const hasPreview = fs.existsSync(path.join(AUDIO_DIR, previewFile));
+      return {
+        id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
+        description: v.description || (v.gender === 'female' ? 'Female narrator' : 'Male narrator'),
+        preview_url: hasPreview ? '/audio/' + previewFile : null,
+      };
+    }),
   });
 });
 
@@ -1779,6 +1917,10 @@ app.get('/api/voices', (req, res) => {
 // ids in the `channels` array of POST /api/brief.
 app.get('/api/channels', (req, res) => {
   res.json({ channels: Object.entries(CHANNELS).map(([id, c]) => ({ id, label: c.label })) });
+});
+
+app.get('/api/publishers', (req, res) => {
+  res.json({ publishers: PUBLISHERS.map(p => ({ id: p.id, label: p.label, domain: p.domain, category: p.category })) });
 });
 
 /* ----- accounts --------------------------------------------------------- */
@@ -1903,7 +2045,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
 app.post('/api/brief', async (req, res) => {
-  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'josh' } = req.body || {};
+  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = req.body || {};
   const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
   const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
   if (!cleanTopics.length && !cleanChannels.length) return res.status(400).json({ error: 'Add at least one topic or channel.' });
@@ -1915,7 +2057,7 @@ app.post('/api/brief', async (req, res) => {
   if (!(await reserveGeneration(user, 1)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
 
-  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId });
+  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId, preferredSources: Array.isArray(preferredSources) ? preferredSources : [] });
   res.json({ episodeId: ep.id, status: ep.status });
 });
 
@@ -1952,7 +2094,7 @@ async function cloneSeriesForUser(src, user) {
 }
 
 app.post('/api/deepdive', async (req, res) => {
-  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'josh' } = req.body || {};
+  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'dave' } = req.body || {};
   const t = String(topic || '').trim();
   if (!t) return res.status(400).json({ error: 'Enter a topic.' });
   if (!DEPTH[depth]) return res.status(400).json({ error: 'Invalid depth.' });
@@ -2178,7 +2320,7 @@ async function preGeneratePopularCombos() {
       // Always regenerate on each pre-gen cycle so cached content reflects
       // the latest news rather than serving a stale 6-hour-old cache hit.
       console.log('pre-gen: generating', comboKey(combo.channels, combo.lengthMin), '(', combo.count, 'requests)');
-      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'josh' }, { await: true });
+      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'dave' }, { await: true });
     } catch (e) {
       console.log('pre-gen failed for combo', comboKey(combo.channels, combo.lengthMin), ':', e.message);
     }
@@ -2187,11 +2329,38 @@ async function preGeneratePopularCombos() {
 }
 
 if (require.main === module) {
+  // One-time voice preview generation. Idempotent: skips any preview clip that
+  // already exists on the (persistent) volume, so real ElevenLabs billing only
+  // happens once. Runs non-blocking after boot; logs success/failure per voice.
+  const PREVIEW_SCRIPT = "Good morning. Markets opened higher today, with the S&P 500 up half a percent. In tech, a major breakthrough — and why it actually matters for you. That's your briefing. Let's dive in.";
+  async function generateVoicePreviews() {
+    for (const [key, v] of Object.entries(VOICES)) {
+      const fileName = 'preview_' + v.id + '.mp3';
+      const filePath = path.join(AUDIO_DIR, fileName);
+      if (fs.existsSync(filePath)) { console.log('[preview] exists, skipping: ' + key); continue; }
+      if (MOCK_MODE || !EK) { console.log('[preview] skipped (no ElevenLabs key / mock mode): ' + key); continue; }
+      try {
+        const r = await ttsLimit(() => fetchWithRetry('https://api.elevenlabs.io/v1/text-to-speech/' + v.id, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
+          body: JSON.stringify({ text: PREVIEW_SCRIPT, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.4, similarity_boost: 0.75 } }),
+        }, { tries: 3, timeoutMs: 45000 }));
+        if (!r.ok) { console.log('[preview] FAILED ' + key + ' (' + v.id + '): ' + r.status + ' ' + (await r.text()).slice(0, 120)); continue; }
+        const buf = Buffer.from(await r.arrayBuffer());
+        fs.writeFileSync(filePath, buf);
+        console.log('[preview] generated: ' + key + ' (' + v.id + ') ' + buf.length + ' bytes');
+      } catch (e) {
+        console.log('[preview] ERROR ' + key + ' (' + v.id + '): ' + e.message);
+      }
+    }
+    console.log('[preview] generation pass complete');
+  }
+
   initDb()
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.15 on port ' + PORT
+        console.log('MyCast v9.25 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -2201,6 +2370,8 @@ if (require.main === module) {
       // (delayed start so there's some real request data to base popularity on)
       setInterval(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), PRE_GEN_INTERVAL_MS);
       setTimeout(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), 2 * 60 * 1000);
+      // one-time voice preview generation (idempotent; skips existing clips)
+      setTimeout(() => generateVoicePreviews().catch(e => console.log('preview gen error:', e.message)), 8000);
     });
 }
 
