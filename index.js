@@ -1203,7 +1203,8 @@ let synthCount = 0; // real (non-cached) synth calls — observability / tests
 /* =========================================================================
    SCRIPT WRITING (Claude) — grounded in retrieved sources for Briefs
    ========================================================================= */
-async function callClaude(prompt, maxTokens) {
+async function callClaude(prompt, maxTokens, opts) {
+  const { timeoutMs = 60000, tries = 3 } = opts || {};
   if (MOCK_MODE) {
     return 'MOCK SCRIPT. ' + 'This is placeholder narration generated without API keys. '.repeat(40);
   }
@@ -1215,7 +1216,7 @@ async function callClaude(prompt, maxTokens) {
       max_tokens: maxTokens || 4096,
       messages: [{ role: 'user', content: prompt }],
     }),
-  }, { tries: 3, timeoutMs: 60000 }));
+  }, { tries, timeoutMs }));
   const d = await r.json();
   if (!d.content || !d.content[0]) throw new Error('Claude error: ' + JSON.stringify(d).slice(0, 300));
   return d.content[0].text.trim();
@@ -1296,7 +1297,15 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, 
     '- Spoken aloud — brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
     'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours; each item may include the article text):\n' +
     sourcesBlock(sortedSources);
-  return callClaude(prompt, 8192);
+  // Long briefs (>=15 min) request ~2400-4800 words in a single call; give the
+  // model materially more time so the request can't abort mid-write. 240s covers
+  // a full 30-min (~4800-word) script with headroom; the 60s default was fine for
+  // short briefs but far too tight for 20-30 min scripts, which is what was making
+  // long Rundowns fail at the writing step. Fewer retries so a genuinely stuck
+  // call fails fast instead of stacking multiple long timeouts. max_tokens 8192
+  // comfortably holds a 30-min script (~6400 tokens).
+  const scriptOpts = lengthMin >= 15 ? { timeoutMs: 240000, tries: 2 } : {};
+  return callClaude(prompt, 8192, scriptOpts);
 }
 
 /* =========================================================================
@@ -1881,7 +1890,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.25', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.26', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2360,7 +2369,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.25 on port ' + PORT
+        console.log('MyCast v9.26 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -2395,3 +2404,4 @@ module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTo
    4. CONCURRENCY: generation runs in-process. Fine for early users; move
       heavy generation to a queue/worker when traffic grows.
    ========================================================================= */
+
