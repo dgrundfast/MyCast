@@ -1278,6 +1278,12 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, 
     '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
     '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
     '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n\n' +
+    'ORIGINALITY & SYNTHESIS (required — quality AND legal):\n' +
+    '- SYNTHESIZE across sources; never summarize any single article. Combine the facts reported by MULTIPLE outlets into ONE account in your OWN original phrasing. Do not track the structure, order, framing, angle, or wording of any one source article.\n' +
+    '- Report the underlying FACTS (who, what, when, where, numbers, outcomes) — not another outlet\'s expression of them. When two sources cover the same event, collapse them into a single fact-based sentence in your own words.\n' +
+    '- GROUND FACTS PRIMARILY in wire services (Associated Press, Reuters) and public broadcasters (BBC, NPR, PBS) when they are present in the sources. Use other outlets to corroborate and to attribute — not as text to paraphrase closely.\n' +
+    '- Attribution names WHO reported a fact; it is NEVER license to mirror HOW they wrote it. "The Journal reports X" must be followed by X stated in your own words.\n' +
+    '- Do not reproduce any source\'s distinctive turns of phrase, headlines, or sentence structure. If a striking exact quote is essential, keep it under 10 words and attribute it.\n\n' +
     'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S&P 500 rose 0.8% to close at 5,432, the Dow gained 180 points, and the NASDAQ slipped 0.3%." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
     'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112-98 last night, improving to 41-28 on the season, while Boston falls to 45-24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
     preferredBlock +
@@ -1868,7 +1874,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.22', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.23', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2346,7 +2352,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.22 on port ' + PORT
+        console.log('MyCast v9.23 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
