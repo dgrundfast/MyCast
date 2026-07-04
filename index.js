@@ -1094,7 +1094,7 @@ async function fromNewsData(query, domains, cutoff) {
       + '&language=en&q=' + encodeURIComponent(query);
     if (domains && domains.length) url += '&domainurl=' + encodeURIComponent(domains.join(','));
     newsdataStats.callsToday++;
-    const r = await fetch(url);
+    const r = await fetchWithRetry(url, {}, { tries: 1, timeoutMs: 8000 });
     if (r.status === 429) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded (429)'); return []; }
     if (!r.ok) { console.log('newsdata http ' + r.status); return []; }
     const d = await r.json();
@@ -1778,16 +1778,23 @@ async function buildBriefEpisode(user, cfg, opts) {
     try {
       ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
       // Preferred-source pass (additive). Lead with trusted outlets' reporting.
-      // Any failure/empty result leaves the normal sources untouched.
+      // Any failure/empty result leaves the normal sources untouched. Hard-capped
+      // at 20s total so a slow news API can never hang the episode — if it can't
+      // finish in time, we silently continue with the normal sources.
       let preferredLabels = [];
       if (hasPreferred) {
         preferredLabels = prefIds.map(pid => (PUBLISHERS_BY_ID[pid] || {}).label).filter(Boolean);
         try {
-          const preferred = await fetchPreferredSources(sectionLabels, prefIds, window);
-          if (preferred.length) {
-            await Promise.all(preferred.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
-            ep.sources = dedupeSources([...preferred, ...ep.sources]).slice(0, 40);
-          }
+          const preferredWork = (async () => {
+            const preferred = await fetchPreferredSources(sectionLabels, prefIds, window);
+            if (preferred.length) {
+              await Promise.all(preferred.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
+              ep.sources = dedupeSources([...preferred, ...ep.sources]).slice(0, 40);
+            }
+          })();
+          const cap = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000));
+          const outcome = await Promise.race([preferredWork.then(() => 'done'), cap]);
+          if (outcome === 'timeout') console.log('preferred-source pass exceeded 20s — continuing with normal sources');
         } catch (e) { console.log('preferred-source pass failed (continuing):', e.message); }
       }
       await store.updateEpisode(ep);
@@ -1874,7 +1881,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.23', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.24', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2352,7 +2359,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.23 on port ' + PORT
+        console.log('MyCast v9.24 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
