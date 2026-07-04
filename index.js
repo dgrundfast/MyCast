@@ -98,6 +98,7 @@ async function initDb() {
       id text PRIMARY KEY, user_id text, data jsonb NOT NULL,
       created_at timestamptz DEFAULT now()
     );
+    CREATE INDEX IF NOT EXISTS idx_series_sig ON series ((data->>'sig'));
   `);
   // safe column adds for pre-existing tables
   for (const t of ['episodes', 'series', 'schedules']) {
@@ -267,6 +268,23 @@ const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N 
 const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'free'; // 'free' = open to all
 
 function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
+
+// Max episode length (minutes) per tier — applies to BOTH Rundowns and Deep Dives.
+// Free gets the short taste (5/10); 20-min is a Plus feature; 30-min is Pro.
+const MAX_LEN_BY_TIER = {
+  free: parseInt(process.env.FREE_MAX_LEN || '10', 10),
+  plus: parseInt(process.env.PLUS_MAX_LEN || '20', 10),
+  pro:  parseInt(process.env.PRO_MAX_LEN  || '30', 10),
+};
+function maxLenForTier(tier) { return MAX_LEN_BY_TIER[tier] != null ? MAX_LEN_BY_TIER[tier] : MAX_LEN_BY_TIER.free; }
+// Lowest tier that unlocks a requested length — used to show a precise upsell.
+function tierForLength(lengthMin) {
+  const n = Number(lengthMin) || 0;
+  if (n <= MAX_LEN_BY_TIER.free) return 'free';
+  if (n <= MAX_LEN_BY_TIER.plus) return 'plus';
+  return 'pro';
+}
+function lengthAllowed(user, lengthMin) { return (Number(lengthMin) || 0) <= maxLenForTier(user.tier); }
 
 /* Billing: RevenueCat webhook config. Set REVENUECAT_WEBHOOK_TOKEN in Railway
    to the same Authorization value you put in RevenueCat's webhook settings.
@@ -525,13 +543,11 @@ async function fromGoogleNews(topic, cutoff) {
       'https://news.google.com/rss/search?q=' + encodeURIComponent(topic) + '&hl=en-US&gl=US&ceid=US:en'
     );
     const out = [];
-    // Use a fallback cutoff of 7 days if the strict window returns nothing
-    const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
     for (const item of feed.items || []) {
       const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-      // Accept article if within strict window OR within 7-day fallback
+      // Strict window only: drop anything older than the user's requested window
       if (isNaN(ts)) continue;
-      if (ts < fallbackCutoff) continue; // older than 7 days, skip entirely
+      if (ts < cutoff) continue;
       const parts = (item.title || '').split(' - '); // "Headline - Publisher"
       const publisher = parts.length > 1 ? parts.pop() : (item.creator || 'News');
       out.push({
@@ -630,14 +646,14 @@ async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
   const feeds = isChannel
     ? (CHANNEL_RSS_MAP[channelIdOrTopic] || PREMIUM_RSS_FEEDS.world)
     : PREMIUM_RSS_FEEDS.world; // fallback for topic searches
-  const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
   const out = [];
   for (const feedUrl of feeds) {
     try {
       const feed = await rss.parseURL(feedUrl);
       for (const item of feed.items || []) {
         const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-        if (isNaN(ts) || ts < fallbackCutoff) continue;
+        // Strict window only: drop anything older than the requested window
+        if (isNaN(ts) || ts < cutoff) continue;
         // Determine publisher from feed URL host
         const publisher = publisherFromFeedUrl(feedUrl);
         out.push({
@@ -1103,13 +1119,13 @@ async function fromNewsData(query, domains, cutoff) {
       if (code && /rate|limit|quota/i.test(String(code))) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded:', code); }
       return [];
     }
-    const fallbackCutoff = Date.now() - 7 * 24 * 3600 * 1000;
     const out = [];
     for (const n of d.results) {
       if (!n || !n.link || !n.title) continue;
       const raw = n.pubDate ? String(n.pubDate).replace(' ', 'T') : '';
       const ts = raw ? Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : raw + 'Z') : NaN;
-      if (isNaN(ts) || ts < fallbackCutoff) continue;
+      // Strict window only: drop anything older than the requested window
+      if (isNaN(ts) || ts < cutoff) continue;
       out.push({
         topic: query,
         publisher: n.source_name || hostnameOf(n.link) || 'News',
@@ -1278,16 +1294,21 @@ async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, 
     '- Use ONLY the source material below, grouped by topic; for each topic use only that topic\'s sources.\n' +
     '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
     '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
-    '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n\n' +
+    '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n' +
+    '- LENGTH IS A CEILING, NOT A QUOTA: if the sources lack enough distinct, factual material to fill the target length, write a SHORTER, denser, more accurate brief. Never pad, repeat a fact in different words, or invent filler to reach the word count.\n\n' +
     'ORIGINALITY & SYNTHESIS (required — quality AND legal):\n' +
     '- SYNTHESIZE across sources; never summarize any single article. Combine the facts reported by MULTIPLE outlets into ONE account in your OWN original phrasing. Do not track the structure, order, framing, angle, or wording of any one source article.\n' +
     '- Report the underlying FACTS (who, what, when, where, numbers, outcomes) — not another outlet\'s expression of them. When two sources cover the same event, collapse them into a single fact-based sentence in your own words.\n' +
     '- GROUND FACTS PRIMARILY in wire services (Associated Press, Reuters) and public broadcasters (BBC, NPR, PBS) when they are present in the sources. Use other outlets to corroborate and to attribute — not as text to paraphrase closely.\n' +
     '- Attribution names WHO reported a fact; it is NEVER license to mirror HOW they wrote it. "The Journal reports X" must be followed by X stated in your own words.\n' +
     '- Do not reproduce any source\'s distinctive turns of phrase, headlines, or sentence structure. If a striking exact quote is essential, keep it under 10 words and attribute it.\n\n' +
-    'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S&P 500 rose 0.8% to close at 5,432, the Dow gained 180 points, and the NASDAQ slipped 0.3%." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
-    'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112-98 last night, improving to 41-28 on the season, while Boston falls to 45-24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
+    'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S and P 500 rose 0.8 percent to close at 5,432, the Dow gained 180 points, and the Nasdaq slipped 0.3 percent." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
+    'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112 to 98 last night, improving to 41 and 28 on the season, while Boston falls to 45 and 24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
     preferredBlock +
+    'WRITE FOR THE EAR (this is spoken aloud by a TTS voice — write numbers and symbols as WORDS):\n' +
+    '- Say "percent" not "%", "dollars" not "$", "and" not "&".\n' +
+    '- Write scores and ranges with the word "to" ("won 5 to 3"); write win-loss records with "and" ("now 41 and 28").\n' +
+    '- Prefer "the United States" over "U.S." Avoid symbols the voice may mangle: %, $, &, #, /, and hyphenated number ranges.\n\n' +
     'STYLE & VOICE:\n' +
     '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
     '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
@@ -1575,6 +1596,7 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
       '- CITE REAL RESEARCH BY NAME: Name specific researchers and studies from the reference material.\n\n' +
       'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
       'statistics, or quotes not supported by the references.\n\n' +
+      'LENGTH IS A CEILING, NOT A QUOTA: if the references lack enough distinct material for the target length, write a shorter, denser, more accurate episode. Never pad, repeat, or invent filler to reach a word count.\n\n' +
       'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences.\n\n' +
       'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
 
@@ -1618,6 +1640,7 @@ async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, 
     '- SYNTHESIS CLOSE: End with a question the listener should be able to answer if they absorbed the material.\n\n' +
     'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
     'statistics, or quotes not supported by the references.\n\n' +
+    'LENGTH IS A CEILING, NOT A QUOTA: if the references lack enough distinct material for the target length, write a shorter, denser, more accurate episode. Never pad, repeat, or invent filler to reach a word count.\n\n' +
     'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences for natural TTS.\n\n' +
     'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
 
@@ -1648,9 +1671,42 @@ function splitIntoSegments(scriptText, wordsPerSegment, firstSegmentWords) {
   return segments.length ? segments : [scriptText];
 }
 
+// Words ElevenLabs commonly mispronounces — respelled phonetically for the TTS
+// INPUT ONLY. The stored/displayed transcript keeps the original spelling.
+// Add entries as you find them (lowercase key; add plural forms separately).
+const TTS_LEXICON = {
+  meme: 'meem', memes: 'meems',
+};
+
+// Rewrite script text into "spoken form" before it reaches ElevenLabs so the
+// voice doesn't mangle symbols, numbers, initialisms, or known-tricky words.
+// Applied ONLY to the audio input — never to the transcript shown in the app.
+function normalizeForTTS(text) {
+  let s = String(text || '');
+  // Initialisms read as words: "U.S." / "U.S.A." -> "United States"
+  s = s.replace(/\bU\.\s?S\.\s?A\.?/g, 'United States');
+  s = s.replace(/\bU\.\s?S\.(?=[\s,.;:!?)\-]|$)/g, 'United States');
+  // Ampersand -> "and" (e.g., "S&P 500" -> "S and P 500")
+  s = s.replace(/\s*&\s*/g, ' and ');
+  // Currency: "$5,432", "$5.4 billion" -> "5,432 dollars", "5.4 billion dollars"
+  s = s.replace(/\$\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
+    (m, num, scale) => num + (scale || '') + ' dollars');
+  // Percent sign -> " percent"  ("0.8%" -> "0.8 percent")
+  s = s.replace(/(\d)\s?%/g, '$1 percent');
+  // Scores / numeric ranges: "112-98" -> "112 to 98"
+  s = s.replace(/\b(\d{1,4})\s?-\s?(\d{1,4})\b/g, '$1 to $2');
+  // Known mispronounced words (whole-word, case-insensitive)
+  for (const k in TTS_LEXICON) {
+    s = s.replace(new RegExp('\\b' + k + '\\b', 'gi'), TTS_LEXICON[k]);
+  }
+  return s.replace(/\s{2,}/g, ' ').trim();
+}
+
 async function synthesizeToFile(text, voiceId) {
-  // content-addressed: identical (voice, text) reuses the same file forever
-  const key = audioKey(voiceId, text);
+  // Normalize to spoken form for the audio; key the cache on the SPOKEN text so
+  // improvements to normalization naturally supersede previously-cached audio.
+  const spoken = normalizeForTTS(text);
+  const key = audioKey(voiceId, spoken);
   const fileName = key + '.mp3';
   const filePath = path.join(AUDIO_DIR, fileName);
   if (fs.existsSync(filePath)) {
@@ -1666,7 +1722,7 @@ async function synthesizeToFile(text, voiceId) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
     body: JSON.stringify({
-      text,
+      text: spoken,
       model_id: 'eleven_multilingual_v2',
       voice_settings: { stability: 0.5, similarity_boost: 0.75 },
     }),
@@ -1890,7 +1946,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.26', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.29', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -1916,7 +1972,7 @@ app.get('/api/voices', (req, res) => {
       return {
         id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
         description: v.description || (v.gender === 'female' ? 'Female narrator' : 'Male narrator'),
-        preview_url: hasPreview ? '/audio/' + previewFile : null,
+        preview_url: hasPreview ? absolute('/audio/' + previewFile) : null,
       };
     }),
   });
@@ -2063,6 +2119,8 @@ app.post('/api/brief', async (req, res) => {
   const user = await getReqUser(req);
   if (!voiceAllowed(user, voiceId))
     return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
+  if (!lengthAllowed(user, lengthMin))
+    return res.status(403).json({ error: 'length_locked', message: lengthMin + '-minute episodes need ' + (tierForLength(lengthMin) === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: tierForLength(lengthMin), maxLengthMin: maxLenForTier(user.tier) });
   if (!(await reserveGeneration(user, 1)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
 
@@ -2111,6 +2169,8 @@ app.post('/api/deepdive', async (req, res) => {
   const user = await getReqUser(req);
   if (!voiceAllowed(user, voiceId))
     return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
+  if (!lengthAllowed(user, episodeLengthMin))
+    return res.status(403).json({ error: 'length_locked', message: episodeLengthMin + '-minute episodes need ' + (tierForLength(episodeLengthMin) === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: tierForLength(episodeLengthMin), maxLengthMin: maxLenForTier(user.tier) });
   if (depth === 'black_belt' && TIER_RANK[user.tier] < TIER_RANK[BLACK_BELT_MIN_TIER])
     return res.status(403).json({ error: 'feature_locked', message: 'Black Belt needs a paid plan.' });
   if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
@@ -2369,7 +2429,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.26 on port ' + PORT
+        console.log('MyCast v9.29 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
