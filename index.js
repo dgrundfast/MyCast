@@ -1676,6 +1676,9 @@ function splitIntoSegments(scriptText, wordsPerSegment, firstSegmentWords) {
 // Add entries as you find them (lowercase key; add plural forms separately).
 const TTS_LEXICON = {
   meme: 'meem', memes: 'meems',
+  thai: 'tie', thais: 'ties',
+  niger: 'nee-zhair', nigerien: 'nee-zhair-ee-en', nigeriens: 'nee-zhair-ee-enz',
+  qatar: 'kuh-tar', qatari: 'kuh-tar-ee',
 };
 
 // Rewrite script text into "spoken form" before it reaches ElevenLabs so the
@@ -1686,15 +1689,30 @@ function normalizeForTTS(text) {
   // Initialisms read as words: "U.S." / "U.S.A." -> "United States"
   s = s.replace(/\bU\.\s?S\.\s?A\.?/g, 'United States');
   s = s.replace(/\bU\.\s?S\.(?=[\s,.;:!?)\-]|$)/g, 'United States');
+  s = s.replace(/\bU\.\s?K\./g, 'United Kingdom');
+  s = s.replace(/\bU\.\s?N\./g, 'United Nations');
+  s = s.replace(/\bE\.\s?U\./g, 'European Union');
   // Ampersand -> "and" (e.g., "S&P 500" -> "S and P 500")
   s = s.replace(/\s*&\s*/g, ' and ');
   // Currency: "$5,432", "$5.4 billion" -> "5,432 dollars", "5.4 billion dollars"
   s = s.replace(/\$\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
     (m, num, scale) => num + (scale || '') + ' dollars');
+  s = s.replace(/£\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
+    (m, num, scale) => num + (scale || '') + ' pounds');
+  s = s.replace(/€\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
+    (m, num, scale) => num + (scale || '') + ' euros');
+  // Degrees: "72°F" -> "72 degrees Fahrenheit"
+  s = s.replace(/(\d)\s?°\s?F\b/g, '$1 degrees Fahrenheit');
+  s = s.replace(/(\d)\s?°\s?C\b/g, '$1 degrees Celsius');
+  s = s.replace(/(\d)\s?°/g, '$1 degrees');
   // Percent sign -> " percent"  ("0.8%" -> "0.8 percent")
   s = s.replace(/(\d)\s?%/g, '$1 percent');
   // Scores / numeric ranges: "112-98" -> "112 to 98"
   s = s.replace(/\b(\d{1,4})\s?-\s?(\d{1,4})\b/g, '$1 to $2');
+  // Common unambiguous abbreviations
+  s = s.replace(/\bvs\.?(?=\s|$)/gi, 'versus');
+  s = s.replace(/\bapprox\./gi, 'approximately');
+  s = s.replace(/\bMt\.\s/g, 'Mount ');
   // Known mispronounced words (whole-word, case-insensitive)
   for (const k in TTS_LEXICON) {
     s = s.replace(new RegExp('\\b' + k + '\\b', 'gi'), TTS_LEXICON[k]);
@@ -1946,7 +1964,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.29', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.30', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2429,7 +2447,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.29 on port ' + PORT
+        console.log('MyCast v9.30 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
