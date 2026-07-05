@@ -265,7 +265,10 @@ const TIER_RANK = { free: 0, plus: 1, pro: 2 };
 
 // ⚠️ PRODUCT DECISIONS (flip these freely):
 const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N generations (default 1)
-const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'free'; // 'free' = open to all
+// Per-depth minimum tier for Deep Dive. Free keeps the two shorter depths
+// (Dangerous, Conversational); Well-versed unlocks at Plus, Black Belt at Pro.
+const WELL_VERSED_MIN_TIER = process.env.WELL_VERSED_MIN_TIER || 'plus';
+const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'pro';
 
 function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
 
@@ -1964,7 +1967,7 @@ async function tickSchedules() {
    ENDPOINTS
    ========================================================================= */
 
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.30', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
+app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.32', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
 
 // One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
 // key/credits without generating a whole episode. Returns the exact failure
@@ -2098,7 +2101,16 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
   }
   const ev = (req.body && req.body.event) || {};
   const type = ev.type || '';
-  const userId = ev.app_user_id || ev.original_app_user_id;
+  // Collect every id RevenueCat ties to this subscriber and prefer the real
+  // usr_ account id, so a purchase still matches even if the primary
+  // app_user_id arrived as an anonymous ($RCAnonymousID) value.
+  const candidates = []
+    .concat(ev.app_user_id ? [ev.app_user_id] : [])
+    .concat(Array.isArray(ev.aliases) ? ev.aliases : [])
+    .concat(ev.original_app_user_id ? [ev.original_app_user_id] : [])
+    .filter((v, i, a) => v && a.indexOf(v) === i)
+    .sort((a, b) => (String(b).startsWith('usr_') ? 1 : 0) - (String(a).startsWith('usr_') ? 1 : 0));
+  const userId = candidates[0];
   if (!userId) return res.json({ ok: true, ignored: 'no app_user_id' });
 
   let tier = null;
@@ -2121,9 +2133,12 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
     console.log('revenuecat ' + type + ' -> no tier change (' + userId + ')');
     return res.json({ ok: true, type, tier: 'unchanged' });
   }
-  const applied = await setUserTier(userId, tier);
-  console.log('revenuecat ' + type + ' -> ' + userId + ' tier=' + tier + (applied ? '' : ' (user not found)'));
-  res.json({ ok: true, type, userId, tier, applied });
+  let applied = false, appliedId = null;
+  for (const id of candidates) {
+    if (await setUserTier(id, tier)) { applied = true; appliedId = id; break; }
+  }
+  console.log('revenuecat ' + type + ' -> ' + (appliedId || userId) + ' tier=' + tier + (applied ? '' : ' (user not found; tried: ' + candidates.join(', ') + ')'));
+  res.json({ ok: true, type, userId: appliedId || userId, tier, applied });
 });
 
 /* ----- GET BRIEFED ------------------------------------------------------ */
@@ -2189,8 +2204,9 @@ app.post('/api/deepdive', async (req, res) => {
     return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
   if (!lengthAllowed(user, episodeLengthMin))
     return res.status(403).json({ error: 'length_locked', message: episodeLengthMin + '-minute episodes need ' + (tierForLength(episodeLengthMin) === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: tierForLength(episodeLengthMin), maxLengthMin: maxLenForTier(user.tier) });
-  if (depth === 'black_belt' && TIER_RANK[user.tier] < TIER_RANK[BLACK_BELT_MIN_TIER])
-    return res.status(403).json({ error: 'feature_locked', message: 'Black Belt needs a paid plan.' });
+  const depthMinTier = depth === 'black_belt' ? BLACK_BELT_MIN_TIER : (depth === 'well_versed' ? WELL_VERSED_MIN_TIER : 'free');
+  if (TIER_RANK[user.tier] < TIER_RANK[depthMinTier])
+    return res.status(403).json({ error: 'depth_locked', message: DEPTH[depth].label + ' needs ' + (depthMinTier === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: depthMinTier, depth });
   if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
     return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
 
@@ -2447,7 +2463,7 @@ if (require.main === module) {
     .catch(e => console.log('DB init error (continuing in-memory):', e.message))
     .finally(() => {
       app.listen(PORT, () =>
-        console.log('MyCast v9.30 on port ' + PORT
+        console.log('MyCast v9.32 on port ' + PORT
           + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
           + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
       // scheduler: tick every minute, plus once shortly after boot
@@ -2482,4 +2498,3 @@ module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTo
    4. CONCURRENCY: generation runs in-process. Fine for early users; move
       heavy generation to a queue/worker when traffic grows.
    ========================================================================= */
-
