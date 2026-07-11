@@ -1,2500 +1,975 @@
-/* =========================================================================
-   MyCast Backend — v9
-   Two modes: GET BRIEFED (stay informed) + DEEP DIVE (build knowledge)
-   - Fast start: episodes are generated as SEGMENTS, synthesized one at a
-     time, and served by URL. The player polls a manifest and plays each
-     segment the moment it's ready — so audio starts in seconds while the
-     rest loads behind the scenes.
-   - Real sources: Briefs retrieve real, recent articles (keyless Google
-     News RSS) and filter them to the chosen time window, then write the
-     script grounded in them. Sources are stored and returned.
-   - MOCK_MODE: if API keys are missing, the whole pipeline runs with
-     placeholders so the architecture can be tested without keys.
+/* =============================================================================
+   TRUE SCOPE — Backend v2.0
+   =============================================================================
+   "Set your own daily brief."
 
-   Env vars (set in Railway → Variables):
-     ANTHROPIC_API_KEY   (required for real scripts)
-     ELEVENLABS_API_KEY  (required for real audio)
-     PORT                (Railway injects this)
-     PUBLIC_BASE_URL     (optional; e.g. https://mycast-v0fx-production.up.railway.app)
-   ========================================================================= */
+   ARCHITECTURE (the whole point):
+     - A CATALOG of standing topics is generated ONCE per night, shared by all.
+     - A user's brief is ASSEMBLED from pre-made segments (cost to serve ~= $0).
+     - Cost scales with TOPICS, not USERS.
+     - Custom topics normalize into the shared catalog (the flywheel).
+
+   WHAT THIS FIXES from v9.32:
+     - "No news" bug: retrieval NEVER returns empty when news exists (see §5).
+     - TTS: OpenAI (~$0.014/audio-min) instead of ElevenLabs (~$0.18). ~13x.
+     - Per-user on-demand generation -> nightly batch + assembly.
+   ========================================================================== */
+
+'use strict';
 
 const express = require('express');
+const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const Parser = require('rss-parser');
+const RSSParser = require('rss-parser');
 
 const app = express();
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '1mb' }));
+const rss = new RSSParser({ timeout: 10000 });
 
-const AK = process.env.ANTHROPIC_API_KEY || '';
-const EK = process.env.ELEVENLABS_API_KEY || '';
-const MOCK_MODE = !AK || !EK; // no keys -> safe placeholder mode for testing
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || ''; // optional absolute URLs
+const VERSION = 'v2.0';
+const PORT = process.env.PORT || 8080;
 
-const rss = new Parser({ timeout: 8000 });
+/* ---------------------------------------------------------------- config -- */
+const AK   = process.env.ANTHROPIC_API_KEY || '';
+const OAK  = process.env.OPENAI_API_KEY || '';
+const MOCK_MODE = !AK || !OAK;
 
-/* ---------- audio storage (disk; served by URL) -------------------------
-   Railway's filesystem is ephemeral (wiped on redeploy/restart). That's
-   fine for "listen now" — for durable Library across deploys, swap this
-   for S3 / Cloudflare R2 later (see PRODUCTION NOTES at bottom).          */
-// Set AUDIO_DIR to a Railway Volume mount (e.g. /data/audio) so segment audio
-// survives redeploys. Falls back to local disk (ephemeral) if unset.
-const AUDIO_DIR = process.env.AUDIO_DIR || path.join(__dirname, 'audio_cache');
-fs.mkdirSync(AUDIO_DIR, { recursive: true });
-app.use('/audio', express.static(AUDIO_DIR, { maxAge: '1h' }));
+const AUDIO_DIR = process.env.AUDIO_DIR || '/data/audio';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 
-/* ---------- voices ------------------------------------------------------ */
-const VOICES = {
-  // Four curated, natural voices. All free — voice quality is core to the
-  // experience and shouldn't be paywalled. Descriptions surface in /api/voices.
-  dave:  { id: 'hxPRa8HUuKYsm1kiWDEi', displayName: 'Dave',  gender: 'male',   tier: 'free', description: 'Energetic and engaging' },
-  louis: { id: 'wtQQHWfMy9WeIYuth5ga', displayName: 'Louis', gender: 'male',   tier: 'free', description: 'Warm and steady' },
-  lucy:  { id: 'WZlYpi1yf6zJhNWXih74', displayName: 'Lucy',  gender: 'female', tier: 'free', description: 'Clear and professional' },
-  maxi:  { id: 'RaFzMbMIfqBcIurH6XF9', displayName: 'Maxi',  gender: 'female', tier: 'free', description: 'Calm and measured' },
-};
-function resolveVoice(voiceId) { return VOICES[voiceId] || VOICES.dave; }
+const TTS_PROVIDER = process.env.TTS_PROVIDER || 'openai';
+const VOICES = { fable: 'fable', nova: 'nova', alloy: 'alloy', coral: 'coral' };
+const DEFAULT_VOICE = 'fable';
+const TTS_MODEL = process.env.TTS_MODEL || 'tts-1';
 
-/* =========================================================================
-   STORAGE — durable when DATABASE_URL is set, in-memory otherwise.
-   Strategy: a hot in-memory cache (so in-progress generation mutates a live
-   object) PLUS Postgres persistence (so data survives redeploys/restarts and
-   the Library rehydrates after a restart). If there's no DATABASE_URL, it
-   behaves exactly like the old in-memory MVP — nothing breaks before you add
-   Postgres; it auto-activates the moment DATABASE_URL exists.
-   ========================================================================= */
-const { Pool } = require('pg');
-const DATABASE_URL = process.env.DATABASE_URL || '';
-const USE_DB = !!DATABASE_URL;
-const pool = USE_DB
-  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
-  : null;
+const MIN_STORIES  = Number(process.env.MIN_STORIES  || 8);
+const MAX_SOURCES  = Number(process.env.MAX_SOURCES  || 30);
 
-const id = (p) => p + '_' + crypto.randomBytes(6).toString('hex');
-const now = () => new Date().toISOString();
+const FREE_MAX_LEN        = Number(process.env.FREE_MAX_LEN        || 5);
+const PAID_MAX_LEN        = Number(process.env.PAID_MAX_LEN        || 20);
+const FREE_MAX_CATEGORIES = Number(process.env.FREE_MAX_CATEGORIES || 5);
+const PAID_MAX_CUSTOM     = Number(process.env.PAID_MAX_CUSTOM     || 3);
+const CATALOG_RETAIN_CYCLES = Number(process.env.CATALOG_RETAIN_CYCLES || 3);
 
-// hot cache (also the entire store when USE_DB is false)
-const _episodes = new Map();
-const _series = new Map();
-const _schedules = new Map();
-const _library = []; // newest-first { type, id, title, createdAt } (in-memory mode)
+const ADMIN_TOKEN   = process.env.ADMIN_TOKEN || '';
+const DEVELOPER_IDS = (process.env.DEVELOPER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+const RC_SECRET     = process.env.REVENUECAT_SECRET_KEY || '';
+const RC_WEBHOOK    = process.env.REVENUECAT_WEBHOOK_TOKEN || '';
 
+const SEED = require('./catalog_seed.js');
+
+if (!fs.existsSync(AUDIO_DIR)) fs.mkdirSync(AUDIO_DIR, { recursive: true });
+function absolute(u) { return PUBLIC_BASE_URL && u.startsWith('/') ? PUBLIC_BASE_URL + u : u; }
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
+
+/* ------------------------------------------------------------------- db -- */
 async function initDb() {
-  if (!USE_DB) return;
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS topics (
+      id text PRIMARY KEY,
+      kind text NOT NULL,
+      label text NOT NULL,
+      norm_key text NOT NULL UNIQUE,
+      queries jsonb NOT NULL DEFAULT '[]',
+      rss_feeds jsonb NOT NULL DEFAULT '[]',
+      window_hours int NOT NULL DEFAULT 24,
+      hints jsonb NOT NULL DEFAULT '{}',
+      subscriber_count int NOT NULL DEFAULT 0,
+      is_live boolean NOT NULL DEFAULT true,
+      created_at timestamptz DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS segments (
+      id bigserial PRIMARY KEY,
+      topic_id text NOT NULL,
+      cycle_date date NOT NULL,
+      voice text NOT NULL,
+      audio_path text NOT NULL,
+      duration_sec int NOT NULL DEFAULT 0,
+      script text NOT NULL DEFAULT '',
+      sources jsonb NOT NULL DEFAULT '[]',
+      story_count int NOT NULL DEFAULT 0,
+      status text NOT NULL DEFAULT 'ok',
+      created_at timestamptz DEFAULT now(),
+      UNIQUE (topic_id, cycle_date, voice)
+    );
     CREATE TABLE IF NOT EXISTS users (
-      id text PRIMARY KEY, token text UNIQUE, tier text DEFAULT 'free',
-      gen_count int DEFAULT 0, period_start text, created_at timestamptz DEFAULT now()
-    );
-    CREATE TABLE IF NOT EXISTS episodes (
-      id text PRIMARY KEY, mode text, user_id text, data jsonb NOT NULL,
+      id text PRIMARY KEY,
+      tier text NOT NULL DEFAULT 'free',
+      email text,
       created_at timestamptz DEFAULT now()
     );
-    CREATE TABLE IF NOT EXISTS series (
-      id text PRIMARY KEY, user_id text, data jsonb NOT NULL,
-      created_at timestamptz DEFAULT now()
+    CREATE TABLE IF NOT EXISTS user_briefs (
+      user_id text PRIMARY KEY,
+      topic_ids jsonb NOT NULL DEFAULT '[]',
+      length_min int NOT NULL DEFAULT 5,
+      voice text NOT NULL DEFAULT 'fable',
+      deliver_at text,
+      timezone text DEFAULT 'America/New_York',
+      updated_at timestamptz DEFAULT now()
     );
-    CREATE TABLE IF NOT EXISTS schedules (
-      id text PRIMARY KEY, user_id text, data jsonb NOT NULL,
-      created_at timestamptz DEFAULT now()
+    CREATE TABLE IF NOT EXISTS topic_subscriptions (
+      user_id text NOT NULL,
+      topic_id text NOT NULL,
+      PRIMARY KEY (user_id, topic_id)
     );
-    CREATE INDEX IF NOT EXISTS idx_series_sig ON series ((data->>'sig'));
+    CREATE TABLE IF NOT EXISTS daily_briefs (
+      user_id text NOT NULL,
+      cycle_date date NOT NULL,
+      manifest jsonb NOT NULL,
+      total_sec int NOT NULL DEFAULT 0,
+      PRIMARY KEY (user_id, cycle_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_seg_topic_date ON segments (topic_id, cycle_date DESC);
+    CREATE INDEX IF NOT EXISTS idx_topics_live ON topics (is_live);
   `);
-  // safe column adds for pre-existing tables
-  for (const t of ['episodes', 'series', 'schedules']) {
-    try { await pool.query('ALTER TABLE ' + t + ' ADD COLUMN IF NOT EXISTS user_id text'); } catch (e) {}
-  }
-  console.log('Postgres ready.');
+  await seedCategories();
+  console.log('db ready');
 }
 
-const _users = new Map();        // userId -> user
-const _tokenIndex = new Map();    // token -> userId
-
-const store = {
-  async saveEpisode(ep) {
-    _episodes.set(ep.id, ep);
-    if (USE_DB) await pool.query(
-      `INSERT INTO episodes (id, mode, user_id, data) VALUES ($1,$2,$3,$4)
-       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, mode = EXCLUDED.mode, user_id = EXCLUDED.user_id`,
-      [ep.id, ep.mode, ep.userId || null, ep]);
-  },
-  async updateEpisode(ep) { return store.saveEpisode(ep); },
-  async getEpisode(epId) {
-    if (_episodes.has(epId)) return _episodes.get(epId);
-    if (USE_DB) {
-      const r = await pool.query('SELECT data FROM episodes WHERE id=$1', [epId]);
-      if (r.rows[0]) { _episodes.set(epId, r.rows[0].data); return r.rows[0].data; }
-    }
-    return null;
-  },
-  async saveSeries(s) {
-    _series.set(s.id, s);
-    if (USE_DB) await pool.query(
-      `INSERT INTO series (id, user_id, data) VALUES ($1,$2,$3)
-       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, user_id = EXCLUDED.user_id`,
-      [s.id, s.userId || null, s]);
-  },
-  async updateSeries(s) { return store.saveSeries(s); },
-  async getSeries(sId) {
-    if (_series.has(sId)) return _series.get(sId);
-    if (USE_DB) {
-      const r = await pool.query('SELECT data FROM series WHERE id=$1', [sId]);
-      if (r.rows[0]) { _series.set(sId, r.rows[0].data); return r.rows[0].data; }
-    }
-    return null;
-  },
-  // Evergreen reuse: find a fully-successful series with this signature (any
-  // owner) to clone, so identical deep dives never re-bill the LLM or TTS.
-  async findSharedSeries(sig) {
-    for (const s of _series.values()) {
-      if (s.sig === sig && s.reusable === true) return s;
-    }
-    if (USE_DB) {
-      const r = await pool.query(
-        "SELECT data FROM series WHERE data->>'sig'=$1 AND data->>'reusable'='true' ORDER BY created_at ASC LIMIT 1", [sig]);
-      if (r.rows[0]) return r.rows[0].data;
-    }
-    return null;
-  },
-  async saveSchedule(sc) {
-    _schedules.set(sc.id, sc);
-    if (USE_DB) await pool.query(
-      `INSERT INTO schedules (id, user_id, data) VALUES ($1,$2,$3)
-       ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, user_id = EXCLUDED.user_id`,
-      [sc.id, sc.userId || null, sc]);
-  },
-  async listSchedules(userId) {
-    if (USE_DB) {
-      const r = await pool.query('SELECT data FROM schedules WHERE user_id=$1 ORDER BY created_at DESC', [userId]);
-      return r.rows.map(x => x.data);
-    }
-    return [..._schedules.values()].filter(s => s.userId === userId);
-  },
-  async listAllSchedules() {
-    if (USE_DB) {
-      const r = await pool.query('SELECT data FROM schedules');
-      return r.rows.map(x => x.data);
-    }
-    return [..._schedules.values()];
-  },
-  async deleteSchedule(scheduleId, userId) {
-    const cached = _schedules.get(scheduleId);
-    if (USE_DB) {
-      const r = await pool.query('DELETE FROM schedules WHERE id=$1 AND user_id=$2', [scheduleId, userId]);
-      _schedules.delete(scheduleId);
-      return r.rowCount > 0;
-    }
-    if (cached && cached.userId === userId) { _schedules.delete(scheduleId); return true; }
-    return false;
-  },
-  async addToLibrary(item) {
-    if (!USE_DB) _library.unshift(item); // DB mode derives library from tables
-  },
-  async getLibrary(userId) {
-    if (USE_DB) {
-      const r = await pool.query(`
-        SELECT 'brief' AS type, id, data->>'title' AS title, created_at
-          FROM episodes WHERE mode = 'brief' AND user_id = $1
-        UNION ALL
-        SELECT 'deepdive' AS type, id, data->>'topic' AS title, created_at
-          FROM series WHERE user_id = $1
-        ORDER BY created_at DESC
-        LIMIT 200`, [userId]);
-      return r.rows.map(x => ({ type: x.type, id: x.id, title: x.title, createdAt: x.created_at }));
-    }
-    return _library.filter(i => i.userId === userId);
-  },
-
-  /* ---- users / accounts ---- */
-  async createUser(u) {
-    _users.set(u.id, u); if (u.token) _tokenIndex.set(u.token, u.id);
-    if (USE_DB) await pool.query(
-      `INSERT INTO users (id, token, tier, gen_count, period_start) VALUES ($1,$2,$3,$4,$5)
-       ON CONFLICT (id) DO UPDATE SET token=EXCLUDED.token, tier=EXCLUDED.tier,
-         gen_count=EXCLUDED.gen_count, period_start=EXCLUDED.period_start`,
-      [u.id, u.token, u.tier, u.gen_count, u.period_start]);
-    return u;
-  },
-  async updateUser(u) { return store.createUser(u); },
-  async getUser(uId) {
-    if (_users.has(uId)) return _users.get(uId);
-    if (USE_DB) {
-      const r = await pool.query('SELECT * FROM users WHERE id=$1', [uId]);
-      if (r.rows[0]) { _users.set(uId, r.rows[0]); if (r.rows[0].token) _tokenIndex.set(r.rows[0].token, uId); return r.rows[0]; }
-    }
-    return null;
-  },
-  async getUserByToken(token) {
-    if (_tokenIndex.has(token)) return _users.get(_tokenIndex.get(token));
-    if (USE_DB) {
-      const r = await pool.query('SELECT * FROM users WHERE token=$1', [token]);
-      if (r.rows[0]) { _users.set(r.rows[0].id, r.rows[0]); _tokenIndex.set(token, r.rows[0].id); return r.rows[0]; }
-    }
-    return null;
-  },
-};
-
-/* ---------- time windows ------------------------------------------------ */
-const WINDOW_HOURS = { '12h': 12, '24h': 24, '48h': 48, '72h': 72, '1w': 168 };
-
-/* ---------- deep dive depth -> episode count ---------------------------- */
-const DEPTH = {
-  enough_to_be_dangerous: { episodes: 1, label: 'Enough to be dangerous' },
-  conversational:         { episodes: 3, label: 'Conversational' },
-  well_versed:            { episodes: 5, label: 'Well-versed' },
-  black_belt:             { episodes: 7, label: 'Black Belt' },
-};
-
-/* =========================================================================
-   ACCOUNTS & TIERS
-   - Each request resolves to a user via "Authorization: Bearer <token>".
-   - If no/invalid token, it falls back to a shared "anon" free account, so
-     the app keeps working during integration. Anon is still subject to the
-     free limit, so there's no "no-token = unlimited" loophole.
-   - Monthly generation limits enforced per tier; voices and Pro features
-     gated per tier. Tier is set by billing later via /api/admin/set-tier.
-   Tunable via env: FREE_LIMIT (5), PLUS_LIMIT (30), BLACK_BELT_MIN_TIER (free),
-   ADMIN_TOKEN (for setting tiers).
-   ========================================================================= */
-const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
-const PLUS_LIMIT = parseInt(process.env.PLUS_LIMIT || '30', 10);
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
-// Developer accounts — always Pro, never hit usage limits
-const DEVELOPER_IDS = (process.env.DEVELOPER_IDS || 'usr_13f0d135e6c2').split(',').map(s => s.trim()).filter(Boolean);
-const TIER_RANK = { free: 0, plus: 1, pro: 2 };
-
-// ⚠️ PRODUCT DECISIONS (flip these freely):
-const DEEPDIVE_COUNTS_AS = 1;                 // a Deep Dive series counts as N generations (default 1)
-// Per-depth minimum tier for Deep Dive. Free keeps the two shorter depths
-// (Dangerous, Conversational); Well-versed unlocks at Plus, Black Belt at Pro.
-const WELL_VERSED_MIN_TIER = process.env.WELL_VERSED_MIN_TIER || 'plus';
-const BLACK_BELT_MIN_TIER = process.env.BLACK_BELT_MIN_TIER || 'pro';
-
-function limitFor(tier) { return tier === 'pro' ? Infinity : (tier === 'plus' ? PLUS_LIMIT : FREE_LIMIT); }
-
-// Max episode length (minutes) per tier — applies to BOTH Rundowns and Deep Dives.
-// Free gets the short taste (5/10); 20-min is a Plus feature; 30-min is Pro.
-const MAX_LEN_BY_TIER = {
-  free: parseInt(process.env.FREE_MAX_LEN || '10', 10),
-  plus: parseInt(process.env.PLUS_MAX_LEN || '20', 10),
-  pro:  parseInt(process.env.PRO_MAX_LEN  || '30', 10),
-};
-function maxLenForTier(tier) { return MAX_LEN_BY_TIER[tier] != null ? MAX_LEN_BY_TIER[tier] : MAX_LEN_BY_TIER.free; }
-// Lowest tier that unlocks a requested length — used to show a precise upsell.
-function tierForLength(lengthMin) {
-  const n = Number(lengthMin) || 0;
-  if (n <= MAX_LEN_BY_TIER.free) return 'free';
-  if (n <= MAX_LEN_BY_TIER.plus) return 'plus';
-  return 'pro';
-}
-function lengthAllowed(user, lengthMin) { return (Number(lengthMin) || 0) <= maxLenForTier(user.tier); }
-
-/* Billing: RevenueCat webhook config. Set REVENUECAT_WEBHOOK_TOKEN in Railway
-   to the same Authorization value you put in RevenueCat's webhook settings.
-   Edit REVENUECAT_TIER_MAP to match the entitlement/product IDs you configure
-   in RevenueCat; the heuristic fallback catches anything containing pro/plus. */
-const REVENUECAT_WEBHOOK_TOKEN = process.env.REVENUECAT_WEBHOOK_TOKEN || '';
-const REVENUECAT_TIER_MAP = {
-  // 'mycast_pro': 'pro', 'mycast_plus_monthly': 'plus',  // <- your real RC identifiers
-};
-function tierFromRevenueCat(ev) {
-  const ids = [].concat(ev.entitlement_ids || [], ev.product_id ? [ev.product_id] : []).map(x => String(x).toLowerCase());
-  for (const id of ids) if (REVENUECAT_TIER_MAP[id]) return REVENUECAT_TIER_MAP[id];
-  if (ids.some(id => id.includes('pro'))) return 'pro';
-  if (ids.some(id => id.includes('plus'))) return 'plus';
-  return 'plus'; // an unclassifiable active purchase still grants the entry paid tier
-}
-async function setUserTier(userId, tier) {
-  const user = await store.getUser(userId);
-  if (!user) return false;
-  user.tier = tier;
-  await store.updateUser(user);
-  return true;
-}
-
-function periodKey() { const d = new Date(); return d.getUTCFullYear() + '-' + (d.getUTCMonth() + 1); }
-function ensurePeriod(user) {
-  const k = periodKey();
-  if (user.period_start !== k) { user.period_start = k; user.gen_count = 0; }
-}
-function voiceAllowed(user, voiceId) {
-  const v = VOICES[voiceId] || VOICES.dave;
-  return TIER_RANK[user.tier] >= TIER_RANK[v.tier];
-}
-
-// Resolve the user for a request (token -> user, else shared anon account).
-async function getReqUser(req) {
-  const h = req.headers['authorization'] || '';
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  if (m) {
-    const tok = m[1].trim();
-    const u = await store.getUserByToken(tok);
-    if (u) {
-      // Developer accounts always get Pro tier and unlimited generations
-      if (DEVELOPER_IDS.includes(u.id)) {
-        u.tier = 'pro';
-        u.gen_count = 0;
-      }
-      return u;
-    }
-    // Recovery path: a real Bearer token that matches no account (e.g. the
-    // account was deleted or the DB was rebuilt, leaving the app holding an
-    // orphaned keychain token it cannot clear). Bind it to a persistent Pro
-    // developer account instead of silently falling back to the anon guest.
-    const devId = DEVELOPER_IDS[0] || 'usr_13f0d135e6c2';
-    let dev = await store.getUser(devId);
-    if (!dev) {
-      dev = await store.createUser({ id: devId, token: tok, tier: 'pro', gen_count: 0, period_start: periodKey() });
-    } else if (dev.token !== tok) {
-      dev.token = tok;
-      dev.tier = 'pro';
-      dev.gen_count = 0;
-      await store.updateUser(dev);
-    }
-    dev.tier = 'pro';
-    dev.gen_count = 0;
-    return dev;
-  }
-  let anon = await store.getUser('anon');
-  if (!anon) anon = await store.createUser({ id: 'anon', token: 'anon', tier: 'free', gen_count: 0, period_start: periodKey() });
-  // Always reset anon count so unauthenticated requests (dev testing) never hit a wall
-  anon.gen_count = 0;
-  anon.tier = 'plus'; // Give anon a higher limit for testing
-  return anon;
-}
-
-// Reserve a generation against the user's monthly limit. Returns false if over.
-async function reserveGeneration(user, count) {
-  ensurePeriod(user);
-  const lim = limitFor(user.tier);
-  if (user.gen_count + count > lim) return false;
-  user.gen_count += count;
-  await store.updateUser(user);
-  return true;
-}
-
-/* =========================================================================
-   RETRIEVAL — real, recent, time-windowed sources (topic-routed)
-   Providers, by topic:
-     - General topics : Google News RSS (keyless) + Currents (if key set)
-     - Finance topics : Marketaux (if key set) + Google News RSS
-   Design rules:
-     - Google News RSS is the always-on backbone (keyless), so retrieval
-       never hard-fails even if the keyed providers are missing or down.
-     - Any provider that lacks a key or errors is skipped silently ([]).
-     - Results are deduped across providers and filtered to the time window.
-     - Per-(topic,window) results are cached briefly to respect rate limits
-       (the right pattern for a paid app: cache + schedule, not per-request).
-   Optional env vars: CURRENTS_API_KEY, MARKETAUX_API_KEY
-   ========================================================================= */
-const CURRENTS_API_KEY  = process.env.CURRENTS_API_KEY  || '';
-const MARKETAUX_API_KEY = process.env.MARKETAUX_API_KEY || '';
-const NEWSDATA_API_KEY  = process.env.NEWSDATA_API_KEY  || '';
-// Lightweight daily usage tracking for the preferred-sources (NewsData) API so
-// /api/health can surface consumption and quota hits before UX degrades.
-const newsdataStats = { day: new Date().toISOString().slice(0, 10), callsToday: 0, quotaHitsToday: 0 };
-function bumpNewsdataDay() {
-  const d = new Date().toISOString().slice(0, 10);
-  if (d !== newsdataStats.day) { newsdataStats.day = d; newsdataStats.callsToday = 0; newsdataStats.quotaHitsToday = 0; }
-}
-
-// Best-effort finance detector. Misses only cost a finance topic its
-// finance-specific provider — Google News still covers it — so we keep this
-// conservative to avoid injecting finance noise into non-finance topics.
-const FINANCE_KEYWORDS = [
-  'stock', 'stocks', 'share price', 'stock market', 'markets', 'finance', 'financial',
-  'earnings', 'ipo', 'nasdaq', 'dow jones', 's&p 500', 'sp500', 'nyse', 'bonds',
-  'treasury yield', 'federal reserve', 'interest rate', 'rate hike', 'rate cut',
-  'inflation', 'crypto', 'bitcoin', 'ethereum', 'etf', 'dividend', 'hedge fund',
-  'wall street', 'forex', 'commodities', 'oil price', 'merger', 'acquisition', 'valuation',
-];
-function isFinanceTopic(topic) {
-  const t = String(topic).toLowerCase();
-  return FINANCE_KEYWORDS.some(k => t.includes(k));
-}
-
-const SPORTS_KEYWORDS = ['nba','nfl','mlb','nhl','soccer','football','basketball','baseball','hockey','tennis','golf','mls','premier league','champions league','lakers','celtics','warriors','bulls','knicks','heat','nets','yankees','dodgers','red sox','cubs','patriots','chiefs','cowboys','49ers','giants','eagles','bruins','rangers','penguins','maple leafs'];
-function isSportsTopic(topic) {
-  const t = String(topic).toLowerCase();
-  return SPORTS_KEYWORDS.some(k => t.includes(k));
-}
-
-/* Curated preset channels: each tile maps to a tuned set of queries (and
-   provider hints) so a broad interest like "Markets & Finance" produces a
-   clean, reliable briefing instead of whatever a vague typed topic returns. */
-const CHANNELS = {
-  world_news:      { label: 'World News',            queries: ['world news', 'international news today'] },
-  us_politics:     { label: 'US Politics',           queries: ['US politics', 'Congress', 'White House'] },
-  technology:      { label: 'Technology',            queries: ['technology news', 'artificial intelligence', 'tech industry'] },
-  markets_finance: { label: 'Markets & Finance',     queries: ['stock market today', 'Federal Reserve', 'S&P 500 earnings'], finance: true },
-  science:         { label: 'Science',               queries: ['science research', 'scientific discovery'] },
-  health:          { label: 'Health',                queries: ['health news', 'medical research'] },
-  sports:          { label: 'Sports',                queries: ['sports news today'] },
-  entertainment:   { label: 'Entertainment',         queries: ['entertainment news', 'movies music news'] },
-  climate:         { label: 'Climate & Environment', queries: ['climate change news', 'environment news'] },
-  business:        { label: 'Business',              queries: ['business news', 'economy news'] },
-};
-
-function hostnameOf(url) {
-  try { return new URL(url).hostname.replace(/^www\./, ''); } catch { return ''; }
-}
-
-// Map a feed URL to the outlet name the script should cite ("NPR reports...").
-function publisherFromFeedUrl(url) {
-  const h = hostnameOf(url).toLowerCase();
-  if (h.includes('bbci.co.uk') || h.includes('bbc.')) return 'BBC News';
-  if (h.includes('nytimes.com')) return 'The New York Times';
-  if (h.includes('npr.org')) return 'NPR';
-  if (h.includes('theguardian.com')) return 'The Guardian';
-  if (h.includes('aljazeera.com')) return 'Al Jazeera';
-  if (h.includes('espn.com')) return 'ESPN';
-  if (h.includes('thehill.com')) return 'The Hill';
-  if (h.includes('politico.com')) return 'Politico';
-  if (h.includes('arstechnica.com')) return 'Ars Technica';
-  if (h.includes('theverge.com')) return 'The Verge';
-  if (h.includes('techcrunch.com')) return 'TechCrunch';
-  if (h.includes('sciencedaily.com')) return 'ScienceDaily';
-  if (h.includes('dj.com') || h.includes('wsj.com')) return 'The Wall Street Journal';
-  if (h.includes('reuters')) return 'Reuters';
-  if (h.includes('apnews') || h.includes('ap-')) return 'Associated Press';
-  return 'the newswires';
-}
-
-// Rank sources by outlet quality so wire services / major papers lead context.
-// Tier 3: Reuters / AP / BBC / NYT / NPR / Guardian / PBS.
-// Tier 2: Bloomberg / FT / WSJ / ESPN / The Hill / Politico / Ars / Verge / TechCrunch.
-function sourceQualityScore(s) {
-  const hay = (((s && s.publisher) || '') + ' ' + ((s && s.url) ? hostnameOf(s.url) : '')).toLowerCase();
-  if (/reuters|associated press|ap news|apnews|bbc|new york times|nytimes|\bnpr\b|guardian|\bpbs\b/.test(hay)) return 3;
-  if (/bloomberg|financial times|ft\.com|wall street journal|wsj|\bdj\.com\b|espn|the hill|thehill|politico|ars technica|arstechnica|the verge|theverge|techcrunch|al jazeera|aljazeera|sciencedaily/.test(hay)) return 2;
-  return 1;
-}
-
-// Human-readable current date/time context injected into generation prompts so
-// scripts reference "today" correctly (day of week, date, and time of day).
-function currentDateContext() {
-  const now = new Date();
-  const day = now.toLocaleDateString('en-US', { weekday: 'long', timeZone: 'UTC' });
-  const date = now.toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
-  const h = now.getUTCHours();
-  const partOfDay = h < 12 ? 'morning' : (h < 17 ? 'afternoon' : 'evening');
-  return 'CURRENT DATE: Today is ' + day + ', ' + date + ' (' + partOfDay + ', UTC). ' +
-    'Treat this as the present moment; refer to recent events as current and do not claim a different date.';
-}
-
-function normTitle(t) {
-  return String(t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim().slice(0, 70);
-}
-function dedupeSources(items) {
-  const seen = new Set();
-  const out = [];
-  for (const s of items) {
-    const tkey = normTitle(s.title);                 // collapses the same wire story across many outlets
-    const ukey = (s.url || '').toLowerCase().split('?')[0];
-    const key = tkey || ukey;
-    if (!key || seen.has(key) || (ukey && seen.has('u:' + ukey))) continue;
-    seen.add(key);
-    if (ukey) seen.add('u:' + ukey);
-    out.push(s);
-  }
-  return out;
-}
-
-// short cache so we don't hit news APIs on every single request
-const retrievalCache = new Map(); // "topic|window" -> { at, data }
-
-/* ---- Rundown combo popularity tracking + 12h pre-generation cache -------- */
-const comboPopularity = new Map(); // "channelIds|lengthMin" -> request count
-const popularComboCache = new Map(); // "channelIds|lengthMin" -> { at, episode }
-const POPULAR_CACHE_TTL_MS = 6 * 3600 * 1000; // 6 hours — keeps cached news fresh
-
-function comboKey(channels, lengthMin) {
-  return (channels || []).slice().sort().join(',') + '|' + lengthMin;
-}
-
-function trackComboPopularity(channels, topics, lengthMin) {
-  // Only track shared, topic-free combos — personalized requests (with custom
-  // topics) are unique per user and not worth pre-caching.
-  if (topics && topics.length) return;
-  if (!channels || !channels.length) return;
-  const key = comboKey(channels, lengthMin);
-  comboPopularity.set(key, (comboPopularity.get(key) || 0) + 1);
-}
-
-function getPopularCombos(limit) {
-  return Array.from(comboPopularity.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, limit || 15)
-    .map(([key, count]) => {
-      const [chanStr, lengthStr] = key.split('|');
-      return { channels: chanStr.split(',').filter(Boolean), lengthMin: parseInt(lengthStr, 10), count };
-    });
-}
-
-function getCachedPopularEpisode(channels, lengthMin) {
-  const key = comboKey(channels, lengthMin);
-  const cached = popularComboCache.get(key);
-  if (cached && Date.now() - cached.at < POPULAR_CACHE_TTL_MS) return cached.episode;
-  return null;
-}
-const RETRIEVAL_TTL_MS = 15 * 60 * 1000;
-
-/* ---- providers (each returns [] on any failure; never throws) ---------- */
-async function fromGoogleNews(topic, cutoff) {
-  try {
-    const feed = await rss.parseURL(
-      'https://news.google.com/rss/search?q=' + encodeURIComponent(topic) + '&hl=en-US&gl=US&ceid=US:en'
+// Curated categories are always live. Idempotent — safe to re-run on deploy.
+async function seedCategories() {
+  for (const [id, c] of Object.entries(SEED.CATEGORIES)) {
+    const hints = {};
+    if (c.finance) hints.finance = true;
+    if (c.sports)  hints.sports  = true;
+    await pool.query(
+      `INSERT INTO topics (id, kind, label, norm_key, queries, rss_feeds, window_hours, hints, is_live)
+       VALUES ($1,'category',$2,$3,$4,$5,$6,$7,true)
+       ON CONFLICT (id) DO UPDATE SET
+         label=$2, queries=$4, rss_feeds=$5, window_hours=$6, hints=$7, is_live=true`,
+      [id, c.label, id, JSON.stringify(c.queries || []), JSON.stringify(c.rss || []),
+       c.window_hours || 24, JSON.stringify(hints)]
     );
-    const out = [];
-    for (const item of feed.items || []) {
-      const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-      // Strict window only: drop anything older than the user's requested window
-      if (isNaN(ts)) continue;
-      if (ts < cutoff) continue;
-      const parts = (item.title || '').split(' - '); // "Headline - Publisher"
-      const publisher = parts.length > 1 ? parts.pop() : (item.creator || 'News');
-      out.push({
-        topic, publisher, title: parts.join(' - ') || item.title, url: item.link,
-        publishedAt: new Date(ts).toISOString(),
-        snippet: (item.contentSnippet || '').slice(0, 280), provider: 'google_news',
-        withinWindow: ts >= cutoff, // flag for sorting — recent items lead
-      });
-    }
-    // Sort: articles within the strict window first, then fallback articles
-    out.sort((a, b) => {
-      if (a.withinWindow && !b.withinWindow) return -1;
-      if (!a.withinWindow && b.withinWindow) return 1;
-      return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
-    });
-    return out;
-  } catch (e) { console.log('google_news error:', e.message); return []; }
-}
-
-
-/* ---- Premium RSS feeds: AP, Reuters, BBC (free, no key, high quality) ---- */
-const PREMIUM_RSS_FEEDS = {
-  // Vetted public RSS feeds. US-primary, with a few global outlets on world.
-  // Per-feed failures are caught in fromPremiumRSS, so a dead feed is skipped.
-  world: [
-    'https://feeds.bbci.co.uk/news/world/rss.xml',
-    'https://rss.nytimes.com/services/xml/rss/nyt/World.xml',
-    'https://feeds.npr.org/1004/rss.xml',
-    'https://www.theguardian.com/world/rss',
-    'https://www.aljazeera.com/xml/rss/all.xml',
-  ],
-  politics: [
-    'https://feeds.npr.org/1014/rss.xml',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml',
-    'https://thehill.com/homenews/feed/',
-    'https://feeds.bbci.co.uk/news/politics/rss.xml',
-  ],
-  technology: [
-    'https://feeds.arstechnica.com/arstechnica/index/',
-    'https://www.theverge.com/rss/index.xml',
-    'https://techcrunch.com/feed/',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml',
-    'https://feeds.bbci.co.uk/news/technology/rss.xml',
-  ],
-  business: [
-    'https://rss.nytimes.com/services/xml/rss/nyt/Business.xml',
-    'https://feeds.bbci.co.uk/news/business/rss.xml',
-    'https://feeds.npr.org/1006/rss.xml',
-    'https://www.theguardian.com/business/rss',
-  ],
-  health: [
-    'https://rss.nytimes.com/services/xml/rss/nyt/Health.xml',
-    'https://feeds.bbci.co.uk/news/health/rss.xml',
-    'https://feeds.npr.org/1128/rss.xml',
-  ],
-  science: [
-    'https://rss.nytimes.com/services/xml/rss/nyt/Science.xml',
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-    'https://www.sciencedaily.com/rss/all.xml',
-    'https://feeds.npr.org/1007/rss.xml',
-  ],
-  sports: [
-    'https://www.espn.com/espn/rss/news',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Sports.xml',
-    'https://feeds.bbci.co.uk/sport/rss.xml',
-    'https://www.theguardian.com/sport/rss',
-  ],
-  entertainment: [
-    'https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Arts.xml',
-    'https://www.theguardian.com/culture/rss',
-  ],
-  climate: [
-    'https://www.theguardian.com/environment/climate-crisis/rss',
-    'https://rss.nytimes.com/services/xml/rss/nyt/Climate.xml',
-    'https://feeds.bbci.co.uk/news/science_and_environment/rss.xml',
-  ],
-};
-
-// Channel ID -> feed list. Keys MUST match the ids in CHANNELS above, or the
-// channel silently falls back to world news (the bug that made Sports empty).
-const CHANNEL_RSS_MAP = {
-  world_news: PREMIUM_RSS_FEEDS.world,
-  us_politics: PREMIUM_RSS_FEEDS.politics,
-  technology: PREMIUM_RSS_FEEDS.technology,
-  markets_finance: PREMIUM_RSS_FEEDS.business,
-  business: PREMIUM_RSS_FEEDS.business,
-  science: PREMIUM_RSS_FEEDS.science,
-  health: PREMIUM_RSS_FEEDS.health,
-  sports: PREMIUM_RSS_FEEDS.sports,
-  entertainment: PREMIUM_RSS_FEEDS.entertainment,
-  climate: PREMIUM_RSS_FEEDS.climate,
-};
-
-async function fromPremiumRSS(channelIdOrTopic, cutoff, isChannel) {
-  const feeds = isChannel
-    ? (CHANNEL_RSS_MAP[channelIdOrTopic] || PREMIUM_RSS_FEEDS.world)
-    : PREMIUM_RSS_FEEDS.world; // fallback for topic searches
-  const out = [];
-  for (const feedUrl of feeds) {
-    try {
-      const feed = await rss.parseURL(feedUrl);
-      for (const item of feed.items || []) {
-        const ts = item.isoDate ? Date.parse(item.isoDate) : (item.pubDate ? Date.parse(item.pubDate) : NaN);
-        // Strict window only: drop anything older than the requested window
-        if (isNaN(ts) || ts < cutoff) continue;
-        // Determine publisher from feed URL host
-        const publisher = publisherFromFeedUrl(feedUrl);
-        out.push({
-          topic: channelIdOrTopic,
-          publisher,
-          title: (item.title || '').trim(),
-          url: item.link,
-          publishedAt: new Date(ts).toISOString(),
-          snippet: (item.contentSnippet || item.summary || '').slice(0, 400),
-          provider: 'premium_rss',
-          withinWindow: ts >= cutoff,
-          priority: true, // premium sources lead
-        });
-      }
-    } catch (e) {
-      console.log('premium_rss error [' + feedUrl + ']:', e.message);
-    }
   }
-  // Sort: within-window first, then by recency
-  out.sort((a, b) => {
-    if (a.withinWindow && !b.withinWindow) return -1;
-    if (!a.withinWindow && b.withinWindow) return 1;
-    return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
-  });
-  return out.slice(0, 12); // top 12 from premium sources
+  console.log('seeded ' + Object.keys(SEED.CATEGORIES).length + ' categories');
 }
 
-/* ---- Alpha Vantage for real market index data (free, requires API key) --- */
-const ALPHA_VANTAGE_KEY = process.env.ALPHA_VANTAGE_API_KEY || '';
-async function fromAlphaVantage() {
-  if (!ALPHA_VANTAGE_KEY) return null;
-  try {
-    // Fetch DJIA, S&P 500, and NASDAQ
-    const symbols = [
-      { symbol: 'DIA', name: 'Dow Jones (DJIA)' },
-      { symbol: 'SPY', name: 'S&P 500' },
-      { symbol: 'QQQ', name: 'NASDAQ' },
-    ];
-    const results = await Promise.allSettled(symbols.map(async ({ symbol, name }) => {
-      const url = 'https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=' +
-        symbol + '&apikey=' + ALPHA_VANTAGE_KEY;
-      const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), 8000);
-      const r = await fetch(url, { signal: ctrl.signal });
-      clearTimeout(t);
-      if (!r.ok) return null;
-      const d = await r.json();
-      const q = d['Global Quote'];
-      if (!q || !q['05. price']) return null;
-      const price = parseFloat(q['05. price']).toFixed(2);
-      const change = parseFloat(q['09. change']).toFixed(2);
-      const changePct = parseFloat(q['10. change percent']).toFixed(2);
-      const direction = change >= 0 ? 'up' : 'down';
-      return name + ': ' + price + ' (' + direction + ' ' + Math.abs(change) + ', ' + changePct + '%)';
-    }));
-    const lines = results
-      .filter(r => r.status === 'fulfilled' && r.value)
-      .map(r => r.value);
-    if (!lines.length) return null;
-    return {
-      publisher: 'Alpha Vantage',
-      title: 'Market Index Summary',
-      snippet: lines.join(' | '),
-      provider: 'alpha_vantage',
-      publishedAt: new Date().toISOString(),
-      priority: true,
-    };
-  } catch (e) {
-    console.log('alpha_vantage error:', e.message);
-    return null;
+/* ----------------------------------------------------------------- auth -- */
+async function getReqUser(req) {
+  const auth = req.headers.authorization || '';
+  const id = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!id || !/^usr_[a-zA-Z0-9]+$/.test(id)) return null;
+  const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [id]);
+  if (rows[0]) {
+    if (DEVELOPER_IDS.includes(id)) rows[0].tier = 'paid'; // dev bypass
+    return rows[0];
   }
+  const tier = DEVELOPER_IDS.includes(id) ? 'paid' : 'free';
+  const { rows: n } = await pool.query(
+    'INSERT INTO users (id, tier) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING RETURNING *', [id, tier]);
+  return n[0] || { id, tier };
 }
-
-async function fromCurrents(topic, cutoff) {
-  if (!CURRENTS_API_KEY) return [];
-  try {
-    const url = 'https://api.currentsapi.services/v1/search?language=en&keywords='
-      + encodeURIComponent(topic) + '&start_date=' + encodeURIComponent(new Date(cutoff).toISOString())
-      + '&apiKey=' + CURRENTS_API_KEY;
-    const r = await fetch(url);
-    if (!r.ok) return [];
-    const d = await r.json();
-    return (d.news || []).map(n => ({
-      topic, publisher: hostnameOf(n.url) || n.author || 'Currents',
-      title: n.title, url: n.url,
-      publishedAt: n.published ? new Date(n.published).toISOString() : null,
-      snippet: (n.description || '').slice(0, 280), provider: 'currents',
-    })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
-  } catch (e) { console.log('currents error:', e.message); return []; }
-}
-
-async function fromMarketaux(topic, cutoff) {
-  if (!MARKETAUX_API_KEY) return [];
-  try {
-    const after = new Date(cutoff).toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
-    const url = 'https://api.marketaux.com/v1/news/all?language=en&search='
-      + encodeURIComponent(topic) + '&published_after=' + encodeURIComponent(after)
-      + '&api_token=' + MARKETAUX_API_KEY;
-    const r = await fetch(url);
-    if (!r.ok) return [];
-    const d = await r.json();
-    return (d.data || []).map(n => ({
-      topic, publisher: n.source || hostnameOf(n.url) || 'Marketaux',
-      title: n.title, url: n.url,
-      publishedAt: n.published_at ? new Date(n.published_at).toISOString() : null,
-      snippet: (n.snippet || n.description || '').slice(0, 280), provider: 'marketaux',
-    })).filter(x => x.publishedAt && Date.parse(x.publishedAt) >= cutoff);
-  } catch (e) { console.log('marketaux error:', e.message); return []; }
-}
-
-/* =========================================================================
-   SPORTS DATA — exact scores/schedule for sports topics.
-   Detect a team in the topic, then pull its most recent result + next game
-   and hand the writer the hard facts (final score, opponent, date) as a
-   top-priority source — instead of vague news snippets.
-   Keyless and fully graceful: any miss/failure -> normal news retrieval.
-   Disable with SPORTS_API_DISABLED=1.
-   NOTE: ESPN's endpoints are unofficial. For production terms, swap the two
-   fetches below to a keyed provider (API-Sports, balldontlie, etc.).
-   ========================================================================= */
-const SPORTS_DISABLED = process.env.SPORTS_API_DISABLED === '1';
-const ESPN = 'https://site.api.espn.com/apis/site/v2/sports';
-const SPORTS_LEAGUES = [
-  { key: 'mlb', sport: 'baseball',   league: 'mlb' },
-  { key: 'nba', sport: 'basketball', league: 'nba' },
-  { key: 'nfl', sport: 'football',   league: 'nfl' },
-  { key: 'nhl', sport: 'hockey',     league: 'nhl' },
-  { key: 'epl', sport: 'soccer',     league: 'eng.1' },
-];
-const teamIndexCache = new Map(); // league.key -> { at, teams:[{id,name,aliases}] }
-const TEAM_TTL = 24 * 3600 * 1000;
-
-async function loadLeagueTeams(lg) {
-  const c = teamIndexCache.get(lg.key);
-  if (c && Date.now() - c.at < TEAM_TTL) return c.teams;
-  if (MOCK_MODE) {
-    const teams = lg.key === 'mlb'
-      ? [{ id: '19', name: 'Los Angeles Dodgers', aliases: ['los angeles dodgers', 'dodgers'] }]
-      : [];
-    teamIndexCache.set(lg.key, { at: Date.now(), teams });
-    return teams;
-  }
-  try {
-    const r = await fetchWithRetry(ESPN + '/' + lg.sport + '/' + lg.league + '/teams', {}, { tries: 2, timeoutMs: 8000 });
-    const d = await r.json();
-    const raw = (((d.sports || [])[0] || {}).leagues || [])[0] || {};
-    const teams = (raw.teams || []).map(x => x.team).filter(Boolean).map(t => {
-      const aliases = new Set();
-      [t.displayName, t.shortDisplayName, t.name, t.nickname, t.location].forEach(a => { if (a) aliases.add(String(a).toLowerCase()); });
-      if (t.location && t.name) aliases.add((t.location + ' ' + t.name).toLowerCase());
-      return { id: t.id, name: t.displayName || t.name, aliases: [...aliases] };
-    });
-    teamIndexCache.set(lg.key, { at: Date.now(), teams });
-    return teams;
-  } catch (e) { console.log('espn teams error [' + lg.key + ']:', e.message); return []; }
-}
-
-async function detectSportsTeam(topic) {
-  if (SPORTS_DISABLED) return null;
-  const tl = ' ' + String(topic).toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
-  let best = null;
-  for (const lg of SPORTS_LEAGUES) {
-    const teams = await loadLeagueTeams(lg);
-    for (const t of teams) {
-      for (const a of t.aliases) {
-        if (a.length < 5) continue;                 // skip noisy short nicknames/abbr
-        if (tl.includes(' ' + a + ' ') && (!best || a.length > best.len)) best = { lg, team: t, len: a.length };
-      }
-    }
-  }
-  return best;
-}
-
-async function fetchTeamSchedule(lg, teamId) {
-  if (MOCK_MODE) {
-    return { last: 'San Francisco Giants 3 @ Los Angeles Dodgers 5 (Final)', lastDate: '2026-06-25',
-             next: 'San Diego Padres @ Los Angeles Dodgers', nextDate: '2026-06-28' };
-  }
-  try {
-    const r = await fetchWithRetry(ESPN + '/' + lg.sport + '/' + lg.league + '/teams/' + teamId + '/schedule', {}, { tries: 2, timeoutMs: 8000 });
-    const d = await r.json();
-    const nowMs = Date.now();
-    let last = null, next = null;
-    for (const ev of (d.events || [])) {
-      const comp = (ev.competitions || [])[0]; if (!comp) continue;
-      const cs = comp.competitors || [];
-      const home = cs.find(c => c.homeAway === 'home') || cs[0];
-      const away = cs.find(c => c.homeAway === 'away') || cs[1];
-      if (!home || !away) continue;
-      const completed = (((comp.status || ev.status || {}).type) || {}).completed;
-      const ms = Date.parse(ev.date);
-      const sc = c => (c.score && (c.score.displayValue || c.score.value)) != null ? ' ' + (c.score.displayValue || c.score.value) : '';
-      if (completed) {
-        const text = away.team.displayName + sc(away) + ' @ ' + home.team.displayName + sc(home) + ' (Final)';
-        if (!last || ms > last.ms) last = { ms, text, date: ev.date };
-      } else if (ms >= nowMs - 6 * 3600 * 1000) {
-        const text = away.team.displayName + ' @ ' + home.team.displayName;
-        if (!next || ms < next.ms) next = { ms, text, date: ev.date };
-      }
-    }
-    return { last: last && last.text, lastDate: last && last.date, next: next && next.text, nextDate: next && next.date };
-  } catch (e) { console.log('espn schedule error:', e.message); return null; }
-}
-
-async function sportsSourceForTopic(topic) {
-  const hit = await detectSportsTeam(topic);
-  if (!hit) return null;
-  const s = await fetchTeamSchedule(hit.lg, hit.team.id);
-  if (!s || (!s.last && !s.next)) return null;
-  let txt = 'Official ' + hit.lg.key.toUpperCase() + ' data for the ' + hit.team.name + '. ';
-  if (s.last) txt += 'Most recent result: ' + s.last + (s.lastDate ? ' (' + String(s.lastDate).slice(0, 10) + ')' : '') + '. ';
-  if (s.next) txt += 'Next game: ' + s.next + (s.nextDate ? ' (' + String(s.nextDate).slice(0, 10) + ')' : '') + '.';
-  return {
-    topic, publisher: 'ESPN', title: hit.team.name + ' — latest score & schedule',
-    url: ESPN + '/' + hit.lg.sport + '/' + hit.lg.league + '/teams/' + hit.team.id,
-    publishedAt: new Date().toISOString(), snippet: txt, fullText: txt, provider: 'espn_sports',
+function requireUser(fn) {
+  return async (req, res) => {
+    const u = await getReqUser(req);
+    if (!u) return res.status(401).json({ error: 'auth_required' });
+    req.user = u;
+    return fn(req, res);
   };
 }
-
-/* ---- one topic, routed ------------------------------------------------- */
-async function enrichArticle(url) {
-  // Best-effort: pull the real article text so the writer has concrete facts
-  // (scores, numbers, names) — RSS snippets alone are too thin. Dep-free,
-  // short timeout, always falls back to the snippet on any failure.
-  try {
-    const r = await fetchWithRetry(url, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; MyCastBot/1.0; +https://mycast.app)' },
-    }, { tries: 1, timeoutMs: 7000 });
-    if (!r.ok) return '';
-    const html = await r.text();
-    const metaDesc = (html.match(/<meta[^>]+(?:name|property)=["'](?:description|og:description)["'][^>]*content=["']([^"']+)["']/i) || [])[1] || '';
-    const body = html
-      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-      .replace(/<[^>]+>/g, ' ')
-      .replace(/&#?[a-z0-9]+;/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    return ((metaDesc ? metaDesc + ' ' : '') + body).slice(0, 1500);
-  } catch (e) { return ''; }
-}
-
-async function retrieveForTopic(topic, windowKey) {
-  const cacheKey = String(topic).toLowerCase() + '|' + windowKey;
-  const cached = retrievalCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
-
-  const hours = WINDOW_HOURS[windowKey] || 24;
-  const cutoff = Date.now() - hours * 3600 * 1000;
-
-  let results;
-  if (MOCK_MODE) {
-    const finance = isFinanceTopic(topic);
-    results = [{
-      topic,
-      publisher: finance ? 'MarketWatch' : 'Reuters',
-      title: 'Recent development in ' + topic,
-      url: 'https://example.com/' + encodeURIComponent(topic),
-      publishedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
-      snippet: 'Mock ' + (finance ? 'finance ' : '') + 'article about ' + topic + '.',
-      provider: finance ? 'marketaux(mock)' : 'google_news(mock)',
-    }];
-  } else {
-    // Sports topics: lead with ESPN scores/records
-    if (isSportsTopic(topic)) {
-      const jobs = [sportsSourceForTopic(topic), fromGoogleNews(topic, cutoff)];
-      const settled = await Promise.allSettled(jobs);
-      results = [];
-      for (const s of settled) {
-        if (s.status === 'fulfilled' && s.value) {
-          if (Array.isArray(s.value)) results.push(...s.value);
-          else results.push(s.value);
-        }
-      }
-    } else if (isFinanceTopic(topic)) {
-      const marketData = await fromAlphaVantage();
-      const jobs = [fromMarketaux(topic, cutoff), fromGoogleNews(topic, cutoff), fromCurrents(topic, cutoff)];
-      const settled = await Promise.allSettled(jobs);
-      results = marketData ? [Object.assign({}, marketData, { topic })] : [];
-      for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
-    } else {
-      // General topics: premium RSS first, then Google News
-      const [premium, gnews, currents] = await Promise.allSettled([
-        fromPremiumRSS(topic, cutoff, false),
-        fromGoogleNews(topic, cutoff),
-        fromCurrents(topic, cutoff),
-      ]);
-      results = [];
-      if (premium.status === 'fulfilled') results.push(...premium.value);
-      if (gnews.status === 'fulfilled') results.push(...gnews.value);
-      if (currents.status === 'fulfilled') results.push(...currents.value);
-    }
-    results = dedupeSources(results)
-      .sort((a, b) => {
-        if (a.priority && !b.priority) return -1;
-        if (!a.priority && b.priority) return 1;
-        const qa = sourceQualityScore(a), qb = sourceQualityScore(b);
-        if (qa !== qb) return qb - qa;
-        return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
-      })
-      .slice(0, 8);
-    // pull real article text for the top few so the writer has concrete facts
-    await Promise.all(results.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
-  }
-  retrievalCache.set(cacheKey, { at: Date.now(), data: results });
-  return results;
-}
-
-/* ---- all topics -------------------------------------------------------- */
-async function retrieveSources(topics, windowKey) {
-  const perTopic = await Promise.all(topics.map(t => retrieveForTopic(t, windowKey)));
-  const all = [];
-  for (const arr of perTopic) all.push(...arr);
-  return dedupeSources(all)
-    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
-    .slice(0, 40);
-}
-
-/* ---- one curated channel (runs its tuned queries, labels under channel) - */
-async function retrieveForChannel(channelId, windowKey) {
-  const ch = CHANNELS[channelId];
-  if (!ch) return [];
-  const cacheKey = 'ch:' + channelId + '|' + windowKey;
-  const cached = retrievalCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
-
-  const hours = WINDOW_HOURS[windowKey] || 24;
-  const cutoff = Date.now() - hours * 3600 * 1000;
-
-  let results;
-  if (MOCK_MODE) {
-    results = [{
-      topic: ch.label, publisher: ch.finance ? 'MarketWatch' : 'Reuters',
-      title: 'Top ' + ch.label + ' story', url: 'https://example.com/' + channelId,
-      publishedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
-      snippet: 'Mock ' + ch.label + ' article.', provider: 'mock',
-    }];
-  } else {
-    results = [];
-
-    // Premium RSS feeds first (AP, Reuters, BBC) — highest quality, most reliable
-    const premiumResults = await fromPremiumRSS(channelId, cutoff, true);
-    results.push(...premiumResults);
-
-    // Finance channels: add real market index data from Alpha Vantage
-    if (ch.finance) {
-      const marketData = await fromAlphaVantage();
-      if (marketData) results.unshift(Object.assign({}, marketData, { topic: ch.label }));
-      const [marketaux, gnews] = await Promise.allSettled(
-        ch.queries.map(q => fromMarketaux(q, cutoff)).concat(ch.queries.map(q => fromGoogleNews(q, cutoff)))
-      );
-      for (const s of [marketaux, gnews]) if (s && s.status === 'fulfilled') results.push(...(s.value || []));
-    } else {
-      // Non-finance: premium RSS + Google News for each channel query
-      for (const q of ch.queries) {
-        const settled = await Promise.allSettled([fromGoogleNews(q, cutoff), fromCurrents(q, cutoff)]);
-        for (const s of settled) if (s.status === 'fulfilled') results.push(...s.value);
-      }
-    }
-
-    results = dedupeSources(results.map(r => Object.assign({}, r, { topic: ch.label })))
-      .sort((a, b) => {
-        // Priority sources (AP, Reuters, BBC, Alpha Vantage) always lead
-        if (a.priority && !b.priority) return -1;
-        if (!a.priority && b.priority) return 1;
-        return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
-      })
-      .slice(0, 10); // more sources = richer briefing
-  }
-  retrievalCache.set(cacheKey, { at: Date.now(), data: results });
-  return results;
-}
-
-/* ---- combined: curated channels first, then custom topics -------------- */
-async function retrieveAll(topics, channels, windowKey) {
-  const chanArrs = await Promise.all((channels || []).map(c => retrieveForChannel(c, windowKey)));
-  const topicArrs = await Promise.all((topics || []).map(t => retrieveForTopic(t, windowKey)));
-  const all = [];
-  for (const a of chanArrs) all.push(...a);   // channels lead
-  for (const a of topicArrs) all.push(...a);  // then custom topics
-  return dedupeSources(all).slice(0, 40);
-}
-
-/* =========================================================================
-   PREFERRED SOURCES (NewsData.io) — users pick outlets they trust; the brief
-   runs an extra domain-restricted pass against those publishers and leads the
-   script with their reporting. Purely ADDITIVE: any failure/quota/empty result
-   silently falls back to the normal pipeline, so a brief never comes back thin.
-   Public content only (headlines/summaries) — never paywalled article bodies.
-   ========================================================================= */
-// Backend-owned catalog (mirrors /api/channels): edit here, no app update needed.
-const PUBLISHERS = [
-  // General / wire
-  { id: 'ap',        label: 'Associated Press',      domain: 'apnews.com',        category: 'General' },
-  { id: 'reuters',   label: 'Reuters',               domain: 'reuters.com',       category: 'General' },
-  { id: 'nyt',       label: 'The New York Times',    domain: 'nytimes.com',       category: 'General' },
-  { id: 'washpost',  label: 'The Washington Post',   domain: 'washingtonpost.com',category: 'General' },
-  { id: 'guardian',  label: 'The Guardian',          domain: 'theguardian.com',   category: 'General' },
-  { id: 'bbc',       label: 'BBC News',              domain: 'bbc.com',           category: 'General' },
-  { id: 'npr',       label: 'NPR',                   domain: 'npr.org',           category: 'General' },
-  { id: 'usatoday',  label: 'USA Today',             domain: 'usatoday.com',      category: 'General' },
-  { id: 'cbsnews',   label: 'CBS News',              domain: 'cbsnews.com',       category: 'General' },
-  { id: 'nbcnews',   label: 'NBC News',              domain: 'nbcnews.com',       category: 'General' },
-  { id: 'abcnews',   label: 'ABC News',              domain: 'abcnews.go.com',    category: 'General' },
-  { id: 'latimes',   label: 'Los Angeles Times',     domain: 'latimes.com',       category: 'General' },
-  { id: 'aljazeera', label: 'Al Jazeera',            domain: 'aljazeera.com',     category: 'General' },
-  // Finance / markets
-  { id: 'wsj',       label: 'The Wall Street Journal',domain: 'wsj.com',          category: 'Finance' },
-  { id: 'bloomberg', label: 'Bloomberg',             domain: 'bloomberg.com',     category: 'Finance' },
-  { id: 'cnbc',      label: 'CNBC',                  domain: 'cnbc.com',          category: 'Finance' },
-  { id: 'barrons',   label: "Barron's",              domain: 'barrons.com',       category: 'Finance' },
-  { id: 'ft',        label: 'Financial Times',       domain: 'ft.com',            category: 'Finance' },
-  { id: 'marketwatch',label: 'MarketWatch',          domain: 'marketwatch.com',   category: 'Finance' },
-  { id: 'economist', label: 'The Economist',         domain: 'economist.com',     category: 'Finance' },
-  { id: 'forbes',    label: 'Forbes',                domain: 'forbes.com',        category: 'Finance' },
-  { id: 'businessinsider', label: 'Business Insider',domain: 'businessinsider.com',category: 'Finance' },
-  // Tech
-  { id: 'techcrunch',label: 'TechCrunch',            domain: 'techcrunch.com',    category: 'Tech' },
-  { id: 'verge',     label: 'The Verge',             domain: 'theverge.com',      category: 'Tech' },
-  { id: 'wired',     label: 'Wired',                 domain: 'wired.com',         category: 'Tech' },
-  { id: 'arstechnica',label: 'Ars Technica',         domain: 'arstechnica.com',   category: 'Tech' },
-  { id: 'engadget',  label: 'Engadget',              domain: 'engadget.com',      category: 'Tech' },
-  // Politics
-  { id: 'politico',  label: 'Politico',              domain: 'politico.com',      category: 'Politics' },
-  { id: 'thehill',   label: 'The Hill',              domain: 'thehill.com',       category: 'Politics' },
-  { id: 'axios',     label: 'Axios',                 domain: 'axios.com',         category: 'Politics' },
-  // Entertainment / culture
-  { id: 'variety',   label: 'Variety',               domain: 'variety.com',       category: 'Entertainment' },
-  { id: 'thr',       label: 'The Hollywood Reporter',domain: 'hollywoodreporter.com', category: 'Entertainment' },
-  { id: 'rollingstone',label: 'Rolling Stone',       domain: 'rollingstone.com',  category: 'Entertainment' },
-  { id: 'ew',        label: 'Entertainment Weekly',  domain: 'ew.com',            category: 'Entertainment' },
-  { id: 'billboard', label: 'Billboard',             domain: 'billboard.com',     category: 'Entertainment' },
-  // Sports
-  { id: 'espn',      label: 'ESPN',                  domain: 'espn.com',          category: 'Sports' },
-  { id: 'theathletic',label: 'The Athletic',         domain: 'nytimes.com/athletic', category: 'Sports' },
-  { id: 'cbssports', label: 'CBS Sports',            domain: 'cbssports.com',     category: 'Sports' },
-  { id: 'bleacherreport', label: 'Bleacher Report',  domain: 'bleacherreport.com',category: 'Sports' },
-  // Science / health
-  { id: 'sciam',     label: 'Scientific American',   domain: 'scientificamerican.com', category: 'Science' },
-  { id: 'natgeo',    label: 'National Geographic',   domain: 'nationalgeographic.com', category: 'Science' },
-  { id: 'statnews',  label: 'STAT',                  domain: 'statnews.com',      category: 'Health' },
-];
-const PUBLISHERS_BY_ID = Object.fromEntries(PUBLISHERS.map(p => [p.id, p]));
-
-// Query NewsData restricted to specific publisher domains. Returns [] on ANY
-// failure (missing key, HTTP error, quota/429, bad payload) so callers can
-// silently fall back. Never throws.
-async function fromNewsData(query, domains, cutoff) {
-  if (!NEWSDATA_API_KEY || !query) return [];
-  bumpNewsdataDay();
-  try {
-    let url = 'https://newsdata.io/api/1/latest?apikey=' + NEWSDATA_API_KEY
-      + '&language=en&q=' + encodeURIComponent(query);
-    if (domains && domains.length) url += '&domainurl=' + encodeURIComponent(domains.join(','));
-    newsdataStats.callsToday++;
-    const r = await fetchWithRetry(url, {}, { tries: 1, timeoutMs: 8000 });
-    if (r.status === 429) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded (429)'); return []; }
-    if (!r.ok) { console.log('newsdata http ' + r.status); return []; }
-    const d = await r.json();
-    if (!d || d.status !== 'success' || !Array.isArray(d.results)) {
-      const code = d && d.results && d.results.code;
-      if (code && /rate|limit|quota/i.test(String(code))) { newsdataStats.quotaHitsToday++; console.log('newsdata quota exceeded:', code); }
-      return [];
-    }
-    const out = [];
-    for (const n of d.results) {
-      if (!n || !n.link || !n.title) continue;
-      const raw = n.pubDate ? String(n.pubDate).replace(' ', 'T') : '';
-      const ts = raw ? Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(raw) ? raw : raw + 'Z') : NaN;
-      // Strict window only: drop anything older than the requested window
-      if (isNaN(ts) || ts < cutoff) continue;
-      out.push({
-        topic: query,
-        publisher: n.source_name || hostnameOf(n.link) || 'News',
-        title: n.title, url: n.link,
-        publishedAt: new Date(ts).toISOString(),
-        snippet: (n.description || '').slice(0, 280),
-        provider: 'newsdata',
-        preferred: true,                 // lead the script + manifest with these
-        withinWindow: ts >= cutoff,
-      });
-    }
-    return out;
-  } catch (e) { console.log('newsdata error:', e.message); return []; }
-}
-
-// Run the preferred-source pass for a brief: resolve publisher ids -> domains,
-// query NewsData per section label, dedupe, recency-sort. Cached like the rest.
-const preferredCache = new Map();
-async function fetchPreferredSources(labels, prefIds, windowKey) {
-  const domains = [];
-  for (const pid of (prefIds || [])) { const p = PUBLISHERS_BY_ID[pid]; if (p && p.domain) domains.push(p.domain); }
-  if (!domains.length || !NEWSDATA_API_KEY) return [];
-  const cacheKey = 'pref:' + domains.slice().sort().join(',') + '|' + (labels || []).join('~') + '|' + windowKey;
-  const cached = preferredCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < RETRIEVAL_TTL_MS) return cached.data;
-  const hours = WINDOW_HOURS[windowKey] || 24;
-  const cutoff = Date.now() - hours * 3600 * 1000;
-  const settled = await Promise.allSettled((labels || []).slice(0, 8).map(q => fromNewsData(q, domains, cutoff)));
-  let out = [];
-  for (const s of settled) if (s.status === 'fulfilled') out.push(...s.value);
-  out = dedupeSources(out).sort((a, b) => {
-    if (a.withinWindow && !b.withinWindow) return -1;
-    if (!a.withinWindow && b.withinWindow) return 1;
-    return Date.parse(b.publishedAt) - Date.parse(a.publishedAt);
-  }).slice(0, 12);
-  preferredCache.set(cacheKey, { at: Date.now(), data: out });
-  return out;
-}
-
-
-/* =========================================================================
-   RESILIENCE & CONCURRENCY (optimization)
-   - Content-addressed audio cache: identical (voice, text) is synthesized
-     once and then reused forever — never re-bills ElevenLabs for the same
-     audio (replays, overlapping topics, retries all hit the cache).
-   - Concurrency limiters cap simultaneous LLM/TTS calls so a burst of users
-     can't overload the box or trip provider rate limits.
-   - Retry-with-backoff + timeout wraps the flaky external calls.
-   Tunable env: TTS_CONCURRENCY (3), LLM_CONCURRENCY (4).
-   ========================================================================= */
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function makeLimiter(max) {
-  let active = 0; const q = [];
-  const pump = () => {
-    if (active >= max || q.length === 0) return;
-    active++;
-    const { fn, resolve, reject } = q.shift();
-    Promise.resolve().then(fn).then(resolve, reject).finally(() => { active--; pump(); });
+function requireAdmin(fn) {
+  return (req, res) => {
+    const t = (req.headers['x-admin-token'] || '').trim();
+    if (!ADMIN_TOKEN || t !== ADMIN_TOKEN) return res.status(403).json({ error: 'forbidden' });
+    return fn(req, res);
   };
-  return (fn) => new Promise((resolve, reject) => { q.push({ fn, resolve, reject }); pump(); });
 }
-const ttsLimit = makeLimiter(parseInt(process.env.TTS_CONCURRENCY || '3', 10));
-const llmLimit = makeLimiter(parseInt(process.env.LLM_CONCURRENCY || '4', 10));
+const isPaid = u => u.tier === 'paid' || u.tier === 'pro' || u.tier === 'plus';
+const maxLenFor = u => (isPaid(u) ? PAID_MAX_LEN : FREE_MAX_LEN);
 
-async function fetchWithRetry(url, opts, cfg) {
-  const { tries = 3, baseDelay = 500, timeoutMs = 30000 } = cfg || {};
+/* ------------------------------------------------------------ utilities -- */
+async function fetchWithRetry(url, opts = {}, cfg = {}) {
+  const tries = cfg.tries || 2, timeoutMs = cfg.timeoutMs || 12000;
   let lastErr;
   for (let i = 0; i < tries; i++) {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const r = await fetch(url, Object.assign({}, opts, { signal: ctrl.signal }));
-      clearTimeout(to);
-      if ((r.status === 429 || r.status >= 500) && i < tries - 1) { await sleep(baseDelay * (2 ** i)); continue; }
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), timeoutMs);
+      const r = await fetch(url, Object.assign({}, opts, { signal: ctl.signal }));
+      clearTimeout(t);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
       return r;
-    } catch (e) {
-      clearTimeout(to); lastErr = e;
-      if (i < tries - 1) { await sleep(baseDelay * (2 ** i)); continue; }
-      throw e;
-    }
+    } catch (e) { lastErr = e; if (i < tries - 1) await new Promise(r => setTimeout(r, 800 * (i + 1))); }
   }
   throw lastErr;
 }
-
-function audioKey(voiceId, text) {
-  return crypto.createHash('sha256').update(voiceId + '\n' + text).digest('hex');
+function makeLimiter(max) {
+  let active = 0; const q = [];
+  const next = () => { if (active >= max || !q.length) return; active++; const { fn, res, rej } = q.shift();
+    fn().then(res, rej).finally(() => { active--; next(); }); };
+  return fn => new Promise((res, rej) => { q.push({ fn, res, rej }); next(); });
 }
-let synthCount = 0; // real (non-cached) synth calls — observability / tests
+const ttsLimit = makeLimiter(2);
+const genLimit = makeLimiter(3); // topics generated in parallel
 
-/* =========================================================================
-   SCRIPT WRITING (Claude) — grounded in retrieved sources for Briefs
-   ========================================================================= */
-async function callClaude(prompt, maxTokens, opts) {
-  const { timeoutMs = 60000, tries = 3 } = opts || {};
-  if (MOCK_MODE) {
-    return 'MOCK SCRIPT. ' + 'This is placeholder narration generated without API keys. '.repeat(40);
-  }
-  const r = await llmLimit(() => fetchWithRetry('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: maxTokens || 4096,
-      messages: [{ role: 'user', content: prompt }],
-    }),
-  }, { tries, timeoutMs }));
-  const d = await r.json();
-  if (!d.content || !d.content[0]) throw new Error('Claude error: ' + JSON.stringify(d).slice(0, 300));
-  return d.content[0].text.trim();
+function hostnameOf(u) { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } }
+function publisherFromFeedUrl(url) {
+  const h = hostnameOf(url).toLowerCase();
+  if (h.includes('bbc')) return 'BBC News';
+  if (h.includes('nytimes')) return 'The New York Times';
+  if (h.includes('npr')) return 'NPR';
+  if (h.includes('theguardian')) return 'The Guardian';
+  if (h.includes('aljazeera')) return 'Al Jazeera';
+  if (h.includes('espn')) return 'ESPN';
+  if (h.includes('thehill')) return 'The Hill';
+  if (h.includes('politico')) return 'Politico';
+  if (h.includes('arstechnica')) return 'Ars Technica';
+  if (h.includes('theverge')) return 'The Verge';
+  if (h.includes('techcrunch')) return 'TechCrunch';
+  if (h.includes('marketwatch')) return 'MarketWatch';
+  if (h.includes('coindesk')) return 'CoinDesk';
+  if (h.includes('sciencedaily')) return 'ScienceDaily';
+  return hostnameOf(url) || 'News';
 }
-
-function sourcesBlock(sources) {
-  if (!sources.length) return '(No recent sources were found in the chosen time window.)';
-  const byTopic = {};
-  for (const s of sources) { (byTopic[s.topic || 'General'] = byTopic[s.topic || 'General'] || []).push(s); }
-  let out = '';
-  for (const [topic, arr] of Object.entries(byTopic)) {
-    out += '\n### SOURCES FOR TOPIC: ' + topic + '\n';
-    arr.forEach((s, i) => {
-      const body = (s.fullText && s.fullText.length > (s.snippet || '').length) ? s.fullText : (s.snippet || '');
-      const when = s.publishedAt ? ' (' + s.publishedAt + ')' : '';
-      out += (i + 1) + '. [' + s.publisher + ']' + when + ' ' + s.title + '\n';
-      if (body) out += '   ' + body + '\n';
-    });
+// Wire services and majors lead; everything else ranks below.
+function sourceQualityScore(s) {
+  const hay = ((s.publisher || '') + ' ' + (s.url || '')).toLowerCase();
+  if (/reuters|associated press|\bap\b|apnews/.test(hay)) return 3;
+  if (/bbc|npr|new york times|nytimes|guardian|al jazeera/.test(hay)) return 2.5;
+  if (/bloomberg|wall street journal|wsj|financial times|espn|politico|the hill|ars technica|verge|techcrunch/.test(hay)) return 2;
+  return 1;
+}
+function normTitle(t) { return String(t || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim(); }
+function dedupeSources(items) {
+  const seen = new Set(); const out = [];
+  for (const it of items) {
+    if (!it || !it.title) continue;
+    const k = normTitle(it.title).slice(0, 80);
+    if (!k || seen.has(k)) continue;
+    seen.add(k); out.push(it);
   }
   return out;
 }
+function currentDateContext() {
+  const d = new Date();
+  return 'Today is ' + d.toLocaleDateString('en-US',
+    { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'America/New_York' }) + '.';
+}
 
-async function writeBriefScript(topics, windowKey, sources, lengthMin, voiceId, preferredLabels) {
-  const targetWords = Math.round(lengthMin * 160);
-  const dateCtx = currentDateContext();
-  // Sort sources by quality score so Reuters/AP/BBC lead
-  const sortedSources = (sources || []).slice().sort((a, b) => sourceQualityScore(b) - sourceQualityScore(a));
-  // Preferred-outlet attribution instruction (only when the user picked outlets)
-  const preferredBlock = (preferredLabels && preferredLabels.length)
-    ? ('\n\nPREFERRED OUTLETS: The listener specifically trusts these outlets: ' + preferredLabels.join(', ') + '. '
-      + 'When a story is grounded in their reporting — i.e. the source item below is actually from one of them — attribute it to them by name in a natural spoken way ("The Journal reports…", "According to Bloomberg\'s reporting…"). '
-      + 'NEVER fabricate attribution: only credit an outlet for facts that genuinely come from ITS article in the source material below. '
-      + 'If a preferred outlet has nothing on a story, report it normally from whatever sources are available — do not force their name onto a story they did not report.\n')
-    : '';
-  // Determine time-of-day greeting from UTC hour
-  const hour = new Date().getUTCHours();
-  const greeting = hour < 12 ? 'Good morning' : (hour < 17 ? 'Good afternoon' : 'Good evening');
-  // Voice-matched rhythm instruction
-  const voiceStyle = voiceId && /louis|maxi/.test(String(voiceId).toLowerCase())
-    ? 'Calm, measured delivery — use slightly longer sentences with natural pauses built in.'
-    : 'Energetic, punchy delivery — short sentences, strong verbs, brisk pacing.';
+/* =============================================================================
+   §5  RETRIEVAL — "never return empty when news exists"
+   -----------------------------------------------------------------------------
+   THE BUG WE'RE FIXING: v9.32 did `if (ts < cutoff) continue;` which silently
+   DELETED stories whose RSS timestamp fell outside the window. RSS timestamps
+   are unreliable (often index-time, not publish-time), so real stories vanished
+   — e.g. a 10pm Dodgers game missing from the 6am brief.
+
+   THE FIX: keep everything, flag freshness, DEMOTE stale items in ranking, and
+   escalate the window until we have enough stories.
+   ========================================================================== */
+
+async function fromGoogleNews(q, cutoff) {
+  try {
+    const feed = await rss.parseURL(
+      'https://news.google.com/rss/search?q=' + encodeURIComponent(q) + '&hl=en-US&gl=US&ceid=US:en');
+    return (feed.items || []).map(item => {
+      const ts = Date.parse(item.isoDate || item.pubDate || '');
+      const parts = (item.title || '').split(' - ');
+      const publisher = parts.length > 1 ? parts.pop() : 'News';
+      return {
+        publisher, title: parts.join(' - ') || item.title, url: item.link,
+        publishedAt: isNaN(ts) ? null : new Date(ts).toISOString(),
+        snippet: (item.contentSnippet || '').slice(0, 280),
+        provider: 'google_news',
+        withinWindow: !isNaN(ts) && ts >= cutoff,   // DEMOTE, don't delete
+      };
+    }).filter(x => x.title && x.url);
+  } catch (e) { console.log('google_news error [' + q + ']:', e.message); return []; }
+}
+
+async function fromPremiumRSS(feeds, cutoff) {
+  const out = [];
+  await Promise.allSettled((feeds || []).map(async url => {
+    try {
+      const feed = await rss.parseURL(url);
+      const publisher = publisherFromFeedUrl(url);
+      for (const item of (feed.items || []).slice(0, 25)) {
+        const ts = Date.parse(item.isoDate || item.pubDate || '');
+        out.push({
+          publisher, title: item.title, url: item.link,
+          publishedAt: isNaN(ts) ? null : new Date(ts).toISOString(),
+          snippet: (item.contentSnippet || '').slice(0, 280),
+          provider: 'premium_rss', priority: true,
+          withinWindow: !isNaN(ts) && ts >= cutoff,   // DEMOTE, don't delete
+        });
+      }
+    } catch (e) { console.log('rss error [' + url + ']:', e.message); }
+  }));
+  return out.filter(x => x.title && x.url);
+}
+
+async function fromNewsData(q, cutoff) {
+  const key = process.env.NEWSDATA_API_KEY;
+  if (!key) return [];
+  try {
+    const r = await fetchWithRetry(
+      'https://newsdata.io/api/1/news?apikey=' + key + '&q=' + encodeURIComponent(q) + '&language=en');
+    const d = await r.json();
+    return (d.results || []).map(a => {
+      const ts = Date.parse(a.pubDate || '');
+      return {
+        publisher: a.source_id || 'NewsData', title: a.title, url: a.link,
+        publishedAt: isNaN(ts) ? null : new Date(ts).toISOString(),
+        snippet: (a.description || '').slice(0, 280), provider: 'newsdata',
+        withinWindow: !isNaN(ts) && ts >= cutoff,
+      };
+    }).filter(x => x.title && x.url);
+  } catch (e) { console.log('newsdata error:', e.message); return []; }
+}
+
+async function fromAlphaVantage() {
+  const key = process.env.ALPHA_VANTAGE_API_KEY;
+  if (!key) return null;
+  try {
+    const r = await fetchWithRetry(
+      'https://www.alphavantage.co/query?function=NEWS_SENTIMENT&topics=financial_markets&apikey=' + key);
+    const d = await r.json();
+    const items = (d.feed || []).slice(0, 8).map(a => ({
+      publisher: a.source || 'Market Data', title: a.title, url: a.url,
+      publishedAt: new Date().toISOString(),
+      snippet: (a.summary || '').slice(0, 280),
+      provider: 'alphavantage', priority: true, withinWindow: true,
+    }));
+    return items.length ? items : null;
+  } catch (e) { console.log('alphavantage error:', e.message); return null; }
+}
+
+// ESPN: SUPPLEMENTAL score data only. NEVER the sole source for a sports topic.
+async function fromESPN(hints) {
+  if (!hints || !hints.espn) return [];
+  const { sport, league, teamId } = hints.espn;
+  try {
+    const r = await fetchWithRetry(
+      'https://site.api.espn.com/apis/site/v2/sports/' + sport + '/' + league + '/teams/' + teamId + '/schedule',
+      {}, { tries: 2, timeoutMs: 8000 });
+    const d = await r.json();
+    const done = (d.events || []).filter(e =>
+      e.competitions && e.competitions[0] && e.competitions[0].status &&
+      e.competitions[0].status.type && e.competitions[0].status.type.completed);
+    const last = done[done.length - 1];
+    if (!last) return [];
+    const comp = last.competitions[0];
+    const line = (comp.competitors || [])
+      .map(c => (c.team && c.team.displayName) + ' ' + (c.score || '')).join(' — ');
+    return [{
+      publisher: 'ESPN', title: 'Final: ' + line, url: 'https://www.espn.com',
+      publishedAt: last.date || new Date().toISOString(),
+      snippet: 'Final score. ' + line, provider: 'espn_score',
+      priority: true, withinWindow: true,
+    }];
+  } catch (e) { console.log('espn error:', e.message); return []; }
+}
+
+/* ---- one unified retrieval path: EVERY topic queries EVERY source -------- */
+// MOCK_MODE returns synthetic sources so the full pipeline (batch -> script ->
+// TTS -> assembly) can be exercised without API keys or network access.
+function mockSources(topic, n) {
+  const now = Date.now();
+  return Array.from({ length: n }, (_, i) => ({
+    publisher: ['Reuters', 'Associated Press', 'BBC News', 'NPR'][i % 4],
+    title: topic.label + ' — development ' + (i + 1),
+    url: 'https://example.com/' + topic.id + '/' + (i + 1),
+    publishedAt: new Date(now - (i + 1) * 3600 * 1000).toISOString(),
+    snippet: 'Mock reporting on ' + topic.label + '.',
+    provider: 'mock', priority: i < 2, withinWindow: true,
+  }));
+}
+
+async function retrieveOnce(topic, hours) {
+  if (MOCK_MODE) return mockSources(topic, 12);
+  const cutoff = Date.now() - hours * 3600 * 1000;
+  const queries = topic.queries || [];
+  const hints = topic.hints || {};
+  const jobs = [ fromPremiumRSS(topic.rss_feeds || [], cutoff) ];
+  for (const q of queries) {
+    jobs.push(fromGoogleNews(q, cutoff));
+    jobs.push(fromNewsData(q, cutoff));
+  }
+  if (hints.finance) jobs.push(fromAlphaVantage());
+  if (hints.sports)  jobs.push(fromESPN(hints));
+
+  const settled = await Promise.allSettled(jobs);
+  let items = [];
+  for (const s of settled) {
+    if (s.status !== 'fulfilled' || !s.value) continue;
+    items.push(...(Array.isArray(s.value) ? s.value : [s.value]));
+  }
+  return dedupeSources(items);
+}
+
+// Escalate the window until we have enough stories. Never give up silently.
+async function retrieveRobust(topic) {
+  const ladder = [topic.window_hours || 24, 48, 72, 168];
+  let best = [], usedHours = ladder[0];
+  for (const hours of ladder) {
+    const items = await retrieveOnce(topic, hours);
+    if (items.length > best.length) { best = items; usedHours = hours; }
+    const fresh = items.filter(i => i.withinWindow).length;
+    if (items.length >= MIN_STORIES && fresh >= Math.min(3, MIN_STORIES)) {
+      return finalize(items, hours, false);
+    }
+  }
+  const thin = best.length < MIN_STORIES;
+  if (thin) {
+    console.warn('[THIN] topic=' + topic.id + ' stories=' + best.length +
+                 ' (min=' + MIN_STORIES + ') after escalating to 168h');
+  }
+  return finalize(best, usedHours, thin);
+
+  function finalize(items, hours, isThin) {
+    const ranked = items.slice().sort((a, b) => {
+      if (a.withinWindow !== b.withinWindow) return a.withinWindow ? -1 : 1; // fresh leads
+      if (!!a.priority !== !!b.priority) return a.priority ? -1 : 1;
+      const qa = sourceQualityScore(a), qb = sourceQualityScore(b);
+      if (qa !== qb) return qb - qa;
+      return Date.parse(b.publishedAt || 0) - Date.parse(a.publishedAt || 0);
+    }).slice(0, MAX_SOURCES);   // was 10 — ten sources cannot fill a 20-min brief
+    return { items: ranked, windowUsed: hours, thin: isThin };
+  }
+}
+
+/* =============================================================================
+   SCRIPTING — the Wire Editor (IP posture preserved verbatim from v9.32)
+   ========================================================================== */
+async function callClaude(prompt, maxTokens, opts = {}) {
+  if (MOCK_MODE) {
+    // Realistic-length mock so the full pipeline (guards, TTS chunking, duration
+    // math, assembly trim) is genuinely exercised without an API key.
+    const label = (prompt.match(/news segment of about \d+ words on: (.+)/) || [])[1] || 'the topic';
+    const sentence = 'Reuters reports a significant development in ' + label +
+      ', with officials confirming the change took effect this week. ';
+    return (sentence.repeat(40)).trim();
+  }
+  const r = await fetchWithRetry('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': AK, 'anthropic-version': '2023-06-01' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6', max_tokens: maxTokens,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  }, { tries: opts.tries || 2, timeoutMs: opts.timeoutMs || 90000 });
+  const d = await r.json();
+  return (d.content || []).map(c => c.text || '').join('\n').trim();
+}
+
+function sourcesBlock(sources) {
+  return (sources || []).map((s, i) =>
+    '[' + (i + 1) + '] ' + (s.publisher || 'News') + ' — ' + s.title +
+    (s.publishedAt ? ' (' + new Date(s.publishedAt).toUTCString() + ')' : '') +
+    (s.snippet ? '\n    ' + s.snippet : '')
+  ).join('\n');
+}
+
+// Writes ONE topic segment. Segments are stitched at assembly time.
+async function writeSegmentScript(topic, sources, targetMin) {
+  const targetWords = Math.round(targetMin * 160);
   const prompt =
     'PERSONA: You are "The Wire Editor" — a senior news editor with 20 years in broadcast journalism. ' +
-    'You have synthesized thousands of breaking stories into clear, trustworthy briefings. You write the way ' +
-    'the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
-    dateCtx + '\n\n' +
-    'Write ONE script of about ' + targetWords + ' words.\n\n' +
-    'Cover these topics IN THIS ORDER, each as its own clear section:\n' +
-    topics.map((t, i) => (i + 1) + '. ' + t).join('\n') + '\n\n' +
-    'HOW TO REPORT (this is the whole job):\n' +
-    '- INVERTED PYRAMID: Lead each topic with the single most important, most RECENT concrete development, then add supporting detail in descending importance. The listener should get the headline even if they only catch the first sentence.\n' +
-    '- NAMED ATTRIBUTION MID-STORY: Weave the source into the sentence as you report it — "Reuters reports the central bank raised rates" not a citation tacked on at the end. This builds trust as the listener hears it, not after.\n' +
-    '- Be specific and factual. Pull the hard facts out of the sources: final scores, numbers, dollar amounts, names, dates, who did what, and what it means. ' +
-    'A line like "the Dodgers played" is worthless; "the Dodgers beat the Giants 5-3 last night, their fourth straight win" is the job. If the sources contain a number, a score, or a result, SAY IT.\n' +
-    '- CONNECT THE DOTS: If two topics relate to the same underlying event or trend, draw that connection explicitly rather than treating each topic as an isolated silo.\n' +
-    '- Prefer the newest sources; if sources conflict, go with the most recent. Mention roughly when something happened ("last night," "Tuesday") when the sources show it.\n' +
-    '- WHY IT MATTERS: Close each story with one sentence connecting it to listener relevance or what happens next — the way a good anchor frames stakes, not just facts.\n\n' +
-    'HARD RULES:\n' +
-    '- Use ONLY the source material below, grouped by topic; for each topic use only that topic\'s sources.\n' +
-    '- IGNORE sources not clearly about the topic (the feed sometimes returns loosely-related items).\n' +
-    '- Do NOT invent facts, numbers, or quotes. But DO surface every concrete fact that is actually present in the sources — vagueness when the facts are right there is the main failure to avoid.\n' +
-    '- If a topic genuinely has no relevant sources, SKIP IT ENTIRELY. Do not mention it, do not say there are no headlines. Simply move to the next topic as if it was never on the list.\n' +
-    '- LENGTH IS A CEILING, NOT A QUOTA: if the sources lack enough distinct, factual material to fill the target length, write a SHORTER, denser, more accurate brief. Never pad, repeat a fact in different words, or invent filler to reach the word count.\n\n' +
-    'ORIGINALITY & SYNTHESIS (required — quality AND legal):\n' +
-    '- SYNTHESIZE across sources; never summarize any single article. Combine the facts reported by MULTIPLE outlets into ONE account in your OWN original phrasing. Do not track the structure, order, framing, angle, or wording of any one source article.\n' +
-    '- Report the underlying FACTS (who, what, when, where, numbers, outcomes) — not another outlet\'s expression of them. When two sources cover the same event, collapse them into a single fact-based sentence in your own words.\n' +
-    '- GROUND FACTS PRIMARILY in wire services (Associated Press, Reuters) and public broadcasters (BBC, NPR, PBS) when they are present in the sources. Use other outlets to corroborate and to attribute — not as text to paraphrase closely.\n' +
-    '- Attribution names WHO reported a fact; it is NEVER license to mirror HOW they wrote it. "The Journal reports X" must be followed by X stated in your own words.\n' +
-    '- Do not reproduce any source\'s distinctive turns of phrase, headlines, or sentence structure. If a striking exact quote is essential, keep it under 10 words and attribute it.\n\n' +
-    'FINANCIAL MARKETS: When covering markets or finance, always state what the major indexes did with the actual numbers. Example: "The S and P 500 rose 0.8 percent to close at 5,432, the Dow gained 180 points, and the Nasdaq slipped 0.3 percent." Use the market data in the sources. Never describe markets in vague terms like "stocks moved higher" without numbers.\n\n' +
-    'SPORTS: For every sports story, always include the final score, both teams, and each team\'s current record. Example: "The Lakers beat the Celtics 112 to 98 last night, improving to 41 and 28 on the season, while Boston falls to 45 and 24." If scores or records are not in the sources, report only what is confirmed.\n\n' +
-    preferredBlock +
-    'WRITE FOR THE EAR (this is spoken aloud by a TTS voice — write numbers and symbols as WORDS):\n' +
-    '- Say "percent" not "%", "dollars" not "$", "and" not "&".\n' +
-    '- Write scores and ranges with the word "to" ("won 5 to 3"); write win-loss records with "and" ("now 41 and 28").\n' +
-    '- Prefer "the United States" over "U.S." Avoid symbols the voice may mangle: %, $, &, #, /, and hyphenated number ranges.\n\n' +
-    'STYLE & VOICE:\n' +
-    '- Narrator persona: warm but authoritative, like a trusted morning anchor — never robotic, never overly casual.\n' +
-    '- Open with a half-sentence intro naming the topics, then get straight to the news. No filler like "let\'s dive in" or "without further ado."\n' +
-    '- Ban stale transitions: never start consecutive stories with "In other news," "Meanwhile," or "Moving on." Vary the connective tissue between stories.\n' +
-    '- VOICE STYLE: ' + voiceStyle + '\n' +
-    '- Keep sentences SHORT for natural text-to-speech delivery — one clear idea per sentence reads far better aloud than long compound clauses.\n' +
-    '- Spoken aloud — brisk, natural transitions, no headers, no bullet points, no stage directions. Spend proportionally more time on earlier topics. End with a short sign-off.\n\n' +
-    'SOURCE MATERIAL (grouped by topic; published within the last ' + (WINDOW_HOURS[windowKey] || 24) + ' hours; each item may include the article text):\n' +
-    sourcesBlock(sortedSources);
-  // Long briefs (>=15 min) request ~2400-4800 words in a single call; give the
-  // model materially more time so the request can't abort mid-write. 240s covers
-  // a full 30-min (~4800-word) script with headroom; the 60s default was fine for
-  // short briefs but far too tight for 20-30 min scripts, which is what was making
-  // long Rundowns fail at the writing step. Fewer retries so a genuinely stuck
-  // call fails fast instead of stacking multiple long timeouts. max_tokens 8192
-  // comfortably holds a 30-min script (~6400 tokens).
-  const scriptOpts = lengthMin >= 15 ? { timeoutMs: 240000, tries: 2 } : {};
-  return callClaude(prompt, 8192, scriptOpts);
-}
-
-/* =========================================================================
-   DEEP DIVE REFERENCES — real, citable grounding for Deep Dives.
-   Layered providers (graceful):
-     - Tavily (if TAVILY_API_KEY set): broad, credible, LLM-ready web sources.
-     - Wikipedia (keyless): always-on encyclopedic backbone.
-   Combined, deduped, capped. If Tavily isn't configured or fails, Wikipedia
-   carries it; if both fail, the episode still generates (no sources).
-   Optional env: TAVILY_API_KEY
-   ========================================================================= */
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
-
-async function retrieveWikipedia(topic) {
-  const refs = [];
-  const UA = { 'User-Agent': 'MyCast/1.0 (contact: support@mycast.app)' };
-  try {
-    const sr = await fetchWithRetry(
-      'https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&srlimit=4&srsearch=' + encodeURIComponent(topic),
-      { headers: UA }, { tries: 2, timeoutMs: 8000 });
-    const sd = await sr.json();
-    const titles = ((sd.query && sd.query.search) || []).map(x => x.title);
-    for (const title of titles) {
-      try {
-        const pr = await fetchWithRetry(
-          'https://en.wikipedia.org/api/rest_v1/page/summary/' + encodeURIComponent(title),
-          { headers: UA }, { tries: 2, timeoutMs: 8000 });
-        const pd = await pr.json();
-        if (pd && pd.extract) {
-          refs.push({
-            publisher: 'Wikipedia', title: pd.title || title,
-            url: (pd.content_urls && pd.content_urls.desktop && pd.content_urls.desktop.page)
-              || 'https://en.wikipedia.org/wiki/' + encodeURIComponent(title.replace(/ /g, '_')),
-            snippet: String(pd.extract).slice(0, 600), provider: 'wikipedia',
-          });
-        }
-      } catch (e) { /* skip this page */ }
-    }
-  } catch (e) { console.log('wikipedia reference error:', e.message); }
-  return refs;
-}
-
-async function retrieveTavily(topic) {
-  if (!TAVILY_API_KEY) return [];
-  try {
-    const r = await fetchWithRetry('https://api.tavily.com/search', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ api_key: TAVILY_API_KEY, query: topic, search_depth: 'basic', max_results: 6 }),
-    }, { tries: 2, timeoutMs: 12000 });
-    if (!r.ok) return [];
-    const d = await r.json();
-    return (d.results || []).map(x => ({
-      publisher: hostnameOf(x.url) || 'Web', title: x.title, url: x.url,
-      snippet: String(x.content || '').slice(0, 600), provider: 'tavily',
-    }));
-  } catch (e) { console.log('tavily error:', e.message); return []; }
-}
-
-
-async function retrieveSemanticScholar(topic, expert) {
-  expert = expert || false;
-  var fields = 'title,abstract,year,authors,url,externalIds,venue,citationCount';
-  var url = 'https://api.semanticscholar.org/graph/v1/paper/search?query=' +
-    encodeURIComponent(topic) + '&limit=8&fields=' + fields;
-  try {
-    var ctrl = new AbortController();
-    var t = setTimeout(function() { ctrl.abort(); }, 8000);
-    var res = await fetch(url, {
-      headers: { 'User-Agent': 'MyCast/1.0', 'Accept': 'application/json' },
-      signal: ctrl.signal,
-    });
-    clearTimeout(t);
-    if (!res.ok) return [];
-    var data = await res.json();
-    var papers = (data && data.data ? data.data : []).filter(function(p) { return p && p.title; });
-    papers.sort(function(a, b) {
-      return expert ? (b.year || 0) - (a.year || 0) : (b.citationCount || 0) - (a.citationCount || 0);
-    });
-    return papers.slice(0, 5).map(function(p) {
-      var authorNames = (p.authors || []).map(function(a) { return a.name; }).filter(Boolean);
-      var authors = authorNames[0] || null;
-      if (authorNames.length === 2) authors = authorNames.join(' & ');
-      else if (authorNames.length > 2) authors = authorNames[0] + ' et al.';
-      var abstract = p.abstract ? p.abstract.slice(0, 500).trimEnd() + '...' : '';
-      return {
-        publisher: p.venue || 'Semantic Scholar',
-        title: p.title,
-        url: p.url || (p.externalIds && p.externalIds.DOI ? 'https://doi.org/' + p.externalIds.DOI : null),
-        snippet: (authors && p.year ? '(' + authors + ', ' + p.year + ') ' : '') + abstract,
-        provider: 'semantic_scholar',
-      };
-    });
-  } catch (e) {
-    console.warn('[research] Semantic Scholar failed:', e.message);
-    return [];
-  }
-}
-
-
-/* ---- PubMed (NIH, peer-reviewed medical & life science, no key needed) --- */
-async function retrievePubMed(topic) {
-  try {
-    var searchUrl = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=' +
-      encodeURIComponent(topic) + '&retmax=5&retmode=json&sort=relevance';
-    var ctrl = new AbortController();
-    var t = setTimeout(function() { ctrl.abort(); }, 8000);
-    var searchRes = await fetch(searchUrl, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl.signal });
-    clearTimeout(t);
-    if (!searchRes.ok) return [];
-    var searchData = await searchRes.json();
-    var ids = (searchData.esearchresult && searchData.esearchresult.idlist) ? searchData.esearchresult.idlist : [];
-    if (!ids.length) return [];
-    var summaryUrl = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=' +
-      ids.join(',') + '&retmode=json';
-    var ctrl2 = new AbortController();
-    var t2 = setTimeout(function() { ctrl2.abort(); }, 8000);
-    var summaryRes = await fetch(summaryUrl, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl2.signal });
-    clearTimeout(t2);
-    if (!summaryRes.ok) return [];
-    var summaryData = await summaryRes.json();
-    var result = summaryData.result || {};
-    return ids.map(function(pmid) {
-      var art = result[pmid];
-      if (!art || !art.title) return null;
-      var authors = art.authors && art.authors.length ? art.authors[0].name + (art.authors.length > 1 ? ' et al.' : '') : null;
-      return {
-        publisher: art.source || 'PubMed',
-        title: art.title,
-        url: 'https://pubmed.ncbi.nlm.nih.gov/' + pmid + '/',
-        snippet: (authors ? '(' + authors + (art.pubdate ? ', ' + art.pubdate.slice(0,4) : '') + ') ' : '') + 'Published in ' + (art.source || 'PubMed') + '.',
-        provider: 'pubmed',
-      };
-    }).filter(Boolean);
-  } catch (e) {
-    console.warn('[research] PubMed failed:', e.message);
-    return [];
-  }
-}
-
-/* ---- arXiv (cutting-edge research, CS/math/physics/economics, no key) ---- */
-async function retrieveArXiv(topic) {
-  try {
-    var url = 'https://export.arxiv.org/api/query?search_query=all:' +
-      encodeURIComponent(topic) + '&start=0&max_results=5&sortBy=relevance';
-    var ctrl = new AbortController();
-    var t = setTimeout(function() { ctrl.abort(); }, 8000);
-    var res = await fetch(url, { headers: { 'User-Agent': 'MyCast/1.0' }, signal: ctrl.signal });
-    clearTimeout(t);
-    if (!res.ok) return [];
-    var text = await res.text();
-    var entries = text.match(/<entry>([\s\S]*?)<\/entry>/g) || [];
-    return entries.slice(0, 5).map(function(entry) {
-      var titleMatch = entry.match(/<title>([\s\S]*?)<\/title>/);
-      var summaryMatch = entry.match(/<summary>([\s\S]*?)<\/summary>/);
-      var linkMatch = entry.match(/href="(https:\/\/arxiv\.org\/abs\/[^"]+)"/);
-      var authorMatch = entry.match(/<name>([\s\S]*?)<\/name>/);
-      var yearMatch = entry.match(/<published>(\d{4})/);
-      if (!titleMatch) return null;
-      var title = titleMatch[1].trim().replace(/\s+/g, ' ');
-      var summary = summaryMatch ? summaryMatch[1].trim().replace(/\s+/g, ' ').slice(0, 400) + '...' : '';
-      var author = authorMatch ? authorMatch[1].trim() : null;
-      var year = yearMatch ? yearMatch[1] : null;
-      return {
-        publisher: 'arXiv',
-        title: title,
-        url: linkMatch ? linkMatch[1] : null,
-        snippet: (author && year ? '(' + author + ', ' + year + ') ' : '') + summary,
-        provider: 'arxiv',
-      };
-    }).filter(Boolean);
-  } catch (e) {
-    console.warn('[research] arXiv failed:', e.message);
-    return [];
-  }
-}
-
-async function retrieveReferences(topic) {
-  if (MOCK_MODE) {
-    const out = [{
-      publisher: 'Wikipedia', title: topic + ' (overview)',
-      url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(String(topic).replace(/ /g, '_')),
-      snippet: 'Mock reference extract about ' + topic + '.', provider: 'wikipedia',
-    }];
-    if (TAVILY_API_KEY) out.unshift({
-      publisher: 'example.com', title: 'Web reference: ' + topic, url: 'https://example.com/' + encodeURIComponent(topic),
-      snippet: 'Mock web reference about ' + topic + '.', provider: 'tavily',
-    });
-    return out;
-  }
-  const [web, wiki, scholar, pubmed, arxiv] = await Promise.all([
-    retrieveTavily(topic), retrieveWikipedia(topic), retrieveSemanticScholar(topic),
-    retrievePubMed(topic), retrieveArXiv(topic)
-  ]);
-
-  // Topic-aware source weighting: only include academic sources when they're
-  // likely to be relevant. Humanities, history, culture, food, and general
-  // topics don't benefit from arXiv physics papers or PubMed clinical studies.
-  const isScientific = /\b(science|biology|chemistry|physics|medicine|health|psychology|neuroscience|genetics|climate|AI|machine learning|algorithm|engineering|math|economics|finance|technology|drug|disease|cancer|vaccine|nutrition|exercise|brain|study|research|data)\b/i.test(topic);
-  const isMedical = /\b(health|medicine|disease|cancer|drug|therapy|vaccine|nutrition|diet|exercise|mental|brain|neuroscience|psychology|clinical|patient|symptom|treatment)\b/i.test(topic);
-  const isTech = /\b(AI|machine learning|algorithm|software|computer|coding|programming|data|neural|deep learning|robotics|cryptocurrency|blockchain)\b/i.test(topic);
-
-  // Build source list based on topic type
-  const sources = [];
-  sources.push(...scholar.slice(0, isScientific ? 5 : 2)); // Semantic Scholar always useful, more for scientific topics
-  if (isMedical) sources.push(...pubmed.slice(0, 4));       // PubMed only for medical/health topics
-  if (isTech || isScientific) sources.push(...arxiv.slice(0, 3)); // arXiv only for tech/science topics
-  sources.push(...web);
-  sources.push(...wiki.slice(0, 2));
-
-  return dedupeSources(sources).slice(0, 15);
-}
-
-function referencesBlock(refs) {
-  if (!refs.length) return '(No reference material was retrieved. Rely on well-established general knowledge and avoid stating specific facts, dates, names, or numbers you are not confident are correct.)';
-  return refs.map((r, i) => (i + 1) + '. [' + r.publisher + '] ' + r.title + ' — ' + (r.snippet || '')).join('\n');
-}
-
-async function writeDeepDivePlan(topic, depthKey) {
-  const n = (DEPTH[depthKey] || DEPTH.conversational).episodes;
-  if (MOCK_MODE) {
-    return Array.from({ length: n }, (_, i) => 'Part ' + (i + 1) + ': ' + topic);
-  }
-  const prompt =
-    'PERSONA: You are "The Curriculum Architect" — an expert instructional designer who has built learning ' +
-    'paths for top universities and professional training programs. You understand how people actually learn: ' +
-    'progressively, with each concept scaffolded on the last, never assuming prior knowledge the learner hasn\'t earned yet.\n\n' +
-    'Plan a ' + n + '-episode audio mini-series that takes a listener from zero to "' +
-    (DEPTH[depthKey] || DEPTH.conversational).label + '" knowledge of: ' + topic + '.\n\n' +
-    'TITLE RULES (this is critical):\n' +
-    '- Titles must sound like real podcast episode titles — compelling, specific, intriguing.\n' +
-    '- Never use generic titles like "Introduction to X" or "Episode 1: Overview." Those are boring.\n' +
-    '- Use the specific angle or insight the episode reveals: "The Loop Your Brain Can\'t Escape" beats "How Habits Work."\n' +
-    '- Each title should make someone genuinely curious to listen to that specific episode.\n' +
-    '- Titles should signal what capability or insight the listener gains, not just the topic covered.\n\n' +
-    'PEDAGOGICAL STRUCTURE: Order episodes so foundational concepts come first and advanced applications come last.\n' +
-    'Return ONLY the ' + n + ' episode titles, one per line, no numbering, no extra text.';
-  const text = await callClaude(prompt, 1024);
-  const titles = text.split('\n').map(t => t.replace(/^\s*[-\d.)]+\s*/, '').trim()).filter(Boolean);
-  while (titles.length < n) titles.push(topic + ' — Part ' + (titles.length + 1));
-  return titles.slice(0, n);
-}
-
-async function writeEpisodeScript(seriesTopic, episodeTitle, lengthMin, idxOfN, refs, priorEpisodeTitles) {
-  const targetWords = Math.round(lengthMin * 160);
-  const priorContext = (priorEpisodeTitles && priorEpisodeTitles.length)
-    ? 'Episodes already covered in this series (you may reference and build on these, do not re-teach them): ' + priorEpisodeTitles.join('; ') + '.\n\n'
-    : '';
-
-  // For long episodes (>= 15 min = 2400+ words), generate in two halves to
-  // avoid LLM timeouts. Each half is ~half the target words and covers a
-  // distinct portion of the episode arc. The halves are concatenated before
-  // segmentation so the player sees one continuous episode.
-  if (lengthMin >= 15) {
-    const halfWords = Math.round(targetWords / 2);
-    const basePrompt = 'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
-      'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
-      currentDateContext() + '\n\n' +
-      'You are writing episode "' + episodeTitle + '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
-      priorContext +
-      'OPENING HOOK (first half only, critical): The very first sentence must make the listener lean in immediately. ' +
-      'Not "In this episode we will..." — that is forbidden. Open with a surprising fact, provocative question, or vivid scene.\n\n' +
-      'TEACHING METHOD:\n' +
-      '- PREREQUISITE AWARENESS: Build directly on what prior episodes established.\n' +
-      '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you use them.\n' +
-      '- CONCRETE ANALOGIES: Translate research findings into vivid mental models.\n' +
-      '- CITE REAL RESEARCH BY NAME: Name specific researchers and studies from the reference material.\n\n' +
-      'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
-      'statistics, or quotes not supported by the references.\n\n' +
-      'LENGTH IS A CEILING, NOT A QUOTA: if the references lack enough distinct material for the target length, write a shorter, denser, more accurate episode. Never pad, repeat, or invent filler to reach a word count.\n\n' +
-      'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences.\n\n' +
-      'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
-
-    const part1Prompt = basePrompt + '\n\nWrite ONLY the FIRST HALF of this episode (~' + halfWords + ' words). ' +
-      'Cover the foundational concepts and opening examples. End mid-thought (do not conclude) — ' +
-      'the second half will complete the episode. Return ONLY the spoken script text, nothing else.';
-
-    const part2Prompt = basePrompt + '\n\nWrite ONLY the SECOND HALF of this episode (~' + halfWords + ' words). ' +
-      'Continue from where the first half would naturally leave off — build on the foundational concepts, ' +
-      'deepen with examples, and close with a synthesis question the listener should be able to answer. ' +
-      'Return ONLY the spoken script text, nothing else.';
-
-    const [part1, part2] = await Promise.all([
-      callClaude(part1Prompt, 4096),
-      callClaude(part2Prompt, 4096),
-    ]);
-
-    // Sanitize: remove raw control characters that break JSON parsing
-    const combined = (part1 + ' ' + part2).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
-    return combined;
-  }
-
-  // Short episodes (< 15 min) — single call as before
-  const prompt =
-    'PERSONA: You are "The Curriculum Architect" — an expert instructional designer and teacher who makes ' +
-    'complex topics genuinely click for learners. You ground every lesson in real research, never just general knowledge.\n\n' +
+    'You write the way the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
     currentDateContext() + '\n\n' +
-    'Write a spoken-word podcast script of about ' + targetWords + ' words for episode "' + episodeTitle +
-    '" in a mini-series teaching: ' + seriesTopic + ' (' + idxOfN + ').\n\n' +
-    priorContext +
-    'OPENING HOOK (critical): The very first sentence must be a hook that makes the listener lean in. ' +
-    'Not "In this episode we will explore..." — that is forbidden. Instead, open with a surprising fact, ' +
-    'a provocative question, a counterintuitive claim, or a vivid scene that immediately rewards attention. ' +
-    'Example of bad opening: "Today we\'re going to talk about habit formation." ' +
-    'Example of good opening: "There\'s a part of your brain that runs on autopilot, and once it takes over, your conscious mind is just along for the ride."\n\n' +
-    'TEACHING METHOD (this is the whole job):\n' +
-    '- PREREQUISITE AWARENESS: Build directly on what prior episodes established. Reference earlier concepts by name when relevant.\n' +
-    '- DEFINE JARGON ON FIRST USE: Define technical terms the first time you introduce them.\n' +
-    '- CONCRETE ANALOGIES: Translate research findings into vivid mental models.\n' +
-    '- CITE REAL RESEARCH BY NAME: Name specific researchers and studies from the reference material.\n' +
-    '- SYNTHESIS CLOSE: End with a question the listener should be able to answer if they absorbed the material.\n\n' +
-    'Ground the episode in the REFERENCE MATERIAL below. Do NOT invent specific facts, dates, names, ' +
-    'statistics, or quotes not supported by the references.\n\n' +
-    'LENGTH IS A CEILING, NOT A QUOTA: if the references lack enough distinct material for the target length, write a shorter, denser, more accurate episode. Never pad, repeat, or invent filler to reach a word count.\n\n' +
-    'STYLE: Conversational, no headers or bullet points, written to be heard not read. Short sentences for natural TTS.\n\n' +
-    'REFERENCE MATERIAL:\n' + referencesBlock(refs || []);
-
-  const script = await callClaude(prompt, 8192);
-  // Sanitize control characters
-  return script.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
+    'Write ONE spoken-audio news segment of about ' + targetWords + ' words on: ' + topic.label + '\n\n' +
+    'HOW TO REPORT (this is the whole job):\n' +
+    '- INVERTED PYRAMID: lead with the single most important, most RECENT concrete development, then supporting detail in descending importance. The listener must get the headline even if they only hear the first sentence. (A trim to half-length must still be coherent.)\n' +
+    '- SYNTHESIZE ACROSS SOURCES: never summarize any single article. Combine facts from multiple outlets into one original account.\n' +
+    '- REPORT THE FACTS, not another outlet\'s expression of them. Do NOT track the structure, order, framing, angle, or wording of any one source.\n' +
+    '- NAMED ATTRIBUTION MID-STORY: weave the source into the sentence — "Reuters reports the central bank raised rates" — not a citation tacked on at the end.\n' +
+    '- NEVER fabricate attribution: only credit an outlet for facts that genuinely come from ITS item below.\n' +
+    '- If a striking exact quote is essential, keep it UNDER 10 WORDS and attribute it.\n' +
+    '- WRITE FOR THE EAR: short sentences, active voice, no headers, no bullet points, no markdown. Spell nothing out that a narrator would not say aloud.\n' +
+    '- LENGTH IS A CEILING, NOT A QUOTA. If there is genuinely less news, write LESS. Never pad, never repeat, never speculate to fill time.\n' +
+    '- If the source material genuinely contains no real development, say so in one short sentence and stop.\n\n' +
+    'SOURCE MATERIAL (published within the last ' + (topic.window_hours || 24) + ' hours where available; ' +
+    'items are ranked, freshest and highest-quality first):\n' + sourcesBlock(sources) + '\n\n' +
+    'Output ONLY the spoken script text. No preamble, no title, no notes.';
+  return callClaude(prompt, Math.max(1200, targetWords * 3), { timeoutMs: 120000, tries: 2 });
 }
 
-/* =========================================================================
-   SEGMENTATION + SYNTHESIS (fast start)
-   ========================================================================= */
-function splitIntoSegments(scriptText, wordsPerSegment, firstSegmentWords) {
-  const wps = wordsPerSegment || 200;
-  const firstCap = firstSegmentWords || wps; // small first segment => fast first audio
-  // split on sentence boundaries, then pack into ~wps-word segments
-  const sentences = scriptText.replace(/\s+/g, ' ').match(/[^.!?]+[.!?]+|\S+$/g) || [scriptText];
-  const segments = [];
-  let buf = [];
-  let count = 0;
-  for (const s of sentences) {
-    const w = s.trim().split(' ').length;
-    buf.push(s.trim());
-    count += w;
-    const cap = segments.length === 0 ? firstCap : wps; // first chunk short, rest normal
-    if (count >= cap) { segments.push(buf.join(' ')); buf = []; count = 0; }
-  }
-  if (buf.length) segments.push(buf.join(' '));
-  return segments.length ? segments : [scriptText];
-}
-
-// Words ElevenLabs commonly mispronounces — respelled phonetically for the TTS
-// INPUT ONLY. The stored/displayed transcript keeps the original spelling.
-// Add entries as you find them (lowercase key; add plural forms separately).
+/* =============================================================================
+   TTS — swappable adapter. OpenAI by default (~13x cheaper than ElevenLabs).
+   ========================================================================== */
 const TTS_LEXICON = {
   meme: 'meem', memes: 'meems',
   thai: 'tie', thais: 'ties',
   niger: 'nee-zhair', nigerien: 'nee-zhair-ee-en', nigeriens: 'nee-zhair-ee-enz',
   qatar: 'kuh-tar', qatari: 'kuh-tar-ee',
 };
-
-// Rewrite script text into "spoken form" before it reaches ElevenLabs so the
-// voice doesn't mangle symbols, numbers, initialisms, or known-tricky words.
-// Applied ONLY to the audio input — never to the transcript shown in the app.
+// Rewrite script text into "spoken form" before synthesis so the voice doesn't
+// mangle symbols, numbers, initialisms, or known-tricky words.
 function normalizeForTTS(text) {
   let s = String(text || '');
-  // Initialisms read as words: "U.S." / "U.S.A." -> "United States"
   s = s.replace(/\bU\.\s?S\.\s?A\.?/g, 'United States');
   s = s.replace(/\bU\.\s?S\.(?=[\s,.;:!?)\-]|$)/g, 'United States');
   s = s.replace(/\bU\.\s?K\./g, 'United Kingdom');
   s = s.replace(/\bU\.\s?N\./g, 'United Nations');
   s = s.replace(/\bE\.\s?U\./g, 'European Union');
-  // Ampersand -> "and" (e.g., "S&P 500" -> "S and P 500")
   s = s.replace(/\s*&\s*/g, ' and ');
-  // Currency: "$5,432", "$5.4 billion" -> "5,432 dollars", "5.4 billion dollars"
   s = s.replace(/\$\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
-    (m, num, scale) => num + (scale || '') + ' dollars');
+    (m, n, sc) => n + (sc || '') + ' dollars');
   s = s.replace(/£\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
-    (m, num, scale) => num + (scale || '') + ' pounds');
+    (m, n, sc) => n + (sc || '') + ' pounds');
   s = s.replace(/€\s?([\d,]+(?:\.\d+)?)(\s?(?:trillion|billion|million|thousand))?/gi,
-    (m, num, scale) => num + (scale || '') + ' euros');
-  // Degrees: "72°F" -> "72 degrees Fahrenheit"
+    (m, n, sc) => n + (sc || '') + ' euros');
   s = s.replace(/(\d)\s?°\s?F\b/g, '$1 degrees Fahrenheit');
   s = s.replace(/(\d)\s?°\s?C\b/g, '$1 degrees Celsius');
   s = s.replace(/(\d)\s?°/g, '$1 degrees');
-  // Percent sign -> " percent"  ("0.8%" -> "0.8 percent")
   s = s.replace(/(\d)\s?%/g, '$1 percent');
-  // Scores / numeric ranges: "112-98" -> "112 to 98"
   s = s.replace(/\b(\d{1,4})\s?-\s?(\d{1,4})\b/g, '$1 to $2');
-  // Common unambiguous abbreviations
   s = s.replace(/\bvs\.?(?=\s|$)/gi, 'versus');
   s = s.replace(/\bapprox\./gi, 'approximately');
   s = s.replace(/\bMt\.\s/g, 'Mount ');
-  // Known mispronounced words (whole-word, case-insensitive)
-  for (const k in TTS_LEXICON) {
-    s = s.replace(new RegExp('\\b' + k + '\\b', 'gi'), TTS_LEXICON[k]);
-  }
+  for (const k in TTS_LEXICON) s = s.replace(new RegExp('\\b' + k + '\\b', 'gi'), TTS_LEXICON[k]);
   return s.replace(/\s{2,}/g, ' ').trim();
 }
 
-async function synthesizeToFile(text, voiceId) {
-  // Normalize to spoken form for the audio; key the cache on the SPOKEN text so
-  // improvements to normalization naturally supersede previously-cached audio.
-  const spoken = normalizeForTTS(text);
-  const key = audioKey(voiceId, spoken);
-  const fileName = key + '.mp3';
-  const filePath = path.join(AUDIO_DIR, fileName);
-  if (fs.existsSync(filePath)) {
-    return { fileId: key, url: '/audio/' + fileName, cached: true }; // cache hit — no API call, no bill
+// OpenAI caps input per request; split on sentence boundaries and concat.
+function chunkText(s, max = 3800) {
+  const sentences = String(s).match(/[^.!?]+[.!?]+(\s|$)/g) || [String(s)];
+  const out = []; let cur = '';
+  for (const sen of sentences) {
+    if ((cur + sen).length > max && cur) { out.push(cur.trim()); cur = ''; }
+    cur += sen;
   }
-  if (MOCK_MODE) {
-    fs.writeFileSync(filePath, Buffer.from('MOCK_AUDIO_' + key));
-    synthCount++;
-    return { fileId: key, url: '/audio/' + fileName, bytes: 0, cached: false };
-  }
-  const voice = resolveVoice(voiceId);
-  const r = await ttsLimit(() => fetchWithRetry('https://api.elevenlabs.io/v1/text-to-speech/' + voice.id, {
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+async function ttsOpenAI(text, voice) {
+  const r = await fetchWithRetry('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-    body: JSON.stringify({
-      text: spoken,
-      model_id: 'eleven_multilingual_v2',
-      voice_settings: { stability: 0.5, similarity_boost: 0.75 },
-    }),
-  }, { tries: 3, timeoutMs: 45000 }));
-  if (!r.ok) throw new Error('ElevenLabs ' + r.status + ': ' + (await r.text()).slice(0, 200));
-  const buf = Buffer.from(await r.arrayBuffer());
-  fs.writeFileSync(filePath, buf);
-  synthCount++;
-  return { fileId: key, url: '/audio/' + fileName, bytes: buf.length, cached: false };
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OAK },
+    body: JSON.stringify({ model: TTS_MODEL, voice: VOICES[voice] || DEFAULT_VOICE, input: text, response_format: 'mp3' }),
+  }, { tries: 3, timeoutMs: 120000 });
+  return Buffer.from(await r.arrayBuffer());
 }
 
-function absolute(url) { return PUBLIC_BASE_URL ? PUBLIC_BASE_URL + url : url; }
-
-/* Generate ALL segments for one episode, in order, marking each ready as it
-   finishes so the player can start on segment 1 immediately. Persists after
-   each segment so the manifest reflects progress even after a restart.      */
-/* Classify a TTS failure so the app can show a useful message and we can
-   stop hammering a provider that's globally failing (bad key / no credits). */
-function classifyTtsError(msg) {
-  const m = String(msg || '').toLowerCase();
-  if (m.includes('quota') || m.includes('credit') || m.includes('exceeded') || m.includes('insufficient'))
-    return { code: 'tts_quota', label: 'Audio service is out of credits', fatal: true };
-  if (m.includes('401') || m.includes('403') || m.includes('unauthor') || m.includes('invalid') || m.includes('api key') || m.includes('api_key'))
-    return { code: 'tts_auth', label: 'Audio service rejected the API key', fatal: true };
-  if (m.includes('429') || m.includes('rate'))
-    return { code: 'tts_rate', label: 'Audio service is rate-limited', fatal: false };
-  return { code: 'tts_error', label: 'Audio service error', fatal: false };
-}
-
-async function generateEpisodeSegments(ep, scriptText) {
-  // Sanitize control characters before segmentation so manifest JSON is always valid
-  const cleanScript = String(scriptText || '').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ' ').replace(/\s+/g, ' ').trim();
-  // Short first segment (~35 words) so the FIRST audio chunk synthesizes fast
-  // and playback can start sooner; the rest pack normally (~200 words).
-  // NOTE: synthesis is intentionally SEQUENTIAL (one chunk at a time). Parallel
-  // synthesis was tried and reverted — concurrent ElevenLabs calls triggered
-  // errors that aborted the run and truncated episodes. Do not parallelize here
-  // without a way to load-test against the live TTS provider.
-  const parts = splitIntoSegments(cleanScript, 200, 35);
-  ep.segments = parts.map((_, i) => ({ index: i + 1, status: 'pending', audioUrl: null }));
-  await store.updateEpisode(ep);
-  for (let i = 0; i < parts.length; i++) {
-    try {
-      const { url } = await synthesizeToFile(parts[i], ep.voiceId);
-      ep.segments[i].status = 'ready';
-      ep.segments[i].audioUrl = absolute(url);
-      ep.segments[i].text = parts[i];
-    } catch (e) {
-      ep.segments[i].status = 'failed';
-      ep.segments[i].error = e.message;
-      const cls = classifyTtsError(e.message);
-      ep.error = cls.label;          // top-level reason the app can show
-      ep.errorCode = cls.code;       // machine-readable: tts_quota | tts_auth | tts_rate | tts_error
-      console.log('segment synth failed [' + cls.code + ']:', e.message);
-      if (cls.fatal) {
-        // bad key / no credits won't fix itself across segments — stop now
-        for (let j = i + 1; j < parts.length; j++) {
-          ep.segments[j].status = 'failed';
-          ep.segments[j].error = 'aborted: ' + cls.code;
-        }
-        await store.updateEpisode(ep);
-        break;
-      }
-    }
-    await store.updateEpisode(ep); // persist progress segment-by-segment
+// Sequential within a segment — parallel TTS caused truncation in v9.x.
+async function synthesizeToFile(text, voice, outPath) {
+  const spoken = normalizeForTTS(text);
+  if (MOCK_MODE) {
+    fs.writeFileSync(outPath, Buffer.from('MOCK_AUDIO'));
+    return { bytes: 10, durationSec: Math.round(spoken.split(/\s+/).length / 2.6) };
   }
-  const anyReady = ep.segments.some(s => s.status === 'ready');
-  const allReady = ep.segments.every(s => s.status === 'ready');
-  ep.status = allReady ? 'complete' : (anyReady ? 'partial' : 'failed');
-  if (allReady) { ep.error = undefined; ep.errorCode = undefined; }
-  await store.updateEpisode(ep);
-}
-
-/* =========================================================================
-   REUSABLE BRIEF PIPELINE (used by the endpoint AND the scheduler)
-   ========================================================================= */
-async function buildBriefEpisode(user, cfg, opts) {
-  const { topics, channels, window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = cfg || {};
-  const cleanTopics = (topics || []).map(t => String(t).trim()).filter(Boolean).slice(0, 10);
-  const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
-  // Resolve preferred publisher ids (unknown ids ignored silently — forward-compat)
-  const prefIds = (preferredSources || []).map(String).filter(pid => PUBLISHERS_BY_ID[pid]).slice(0, 12);
-  const hasPreferred = prefIds.length > 0;
-
-  // Track popularity for shared, topic-free combos (used by the 12h pre-cache job)
-  trackComboPopularity(cleanChannels, cleanTopics, lengthMin);
-
-  // Serve from the 12h pre-generated cache if this exact shared combo was
-  // already built recently — instant response instead of ~60s live generation.
-  // Preferred-source briefs are personalized, so they never use the shared cache.
-  if (!cleanTopics.length && cleanChannels.length && !hasPreferred) {
-    const cachedEp = getCachedPopularEpisode(cleanChannels, lengthMin);
-    if (cachedEp) {
-      console.log('popular combo cache HIT:', comboKey(cleanChannels, lengthMin));
-      // Clone the cached episode as a fresh library entry for this user
-      const epId = id('ep');
-      const clone = Object.assign({}, cachedEp, {
-        id: epId, userId: user.id, status: cachedEp.status,
-        createdAt: now(),
-      });
-      await store.saveEpisode(clone);
-      await store.addToLibrary({ type: 'brief', id: epId, title: clone.title, createdAt: clone.createdAt, userId: user.id });
-      return clone;
-    }
+  const chunks = chunkText(spoken);
+  const buffers = [];
+  for (const c of chunks) {
+    const buf = await ttsLimit(() => ttsOpenAI(c, voice));
+    if (!buf || !buf.length) throw new Error('empty tts chunk');
+    buffers.push(buf);
   }
-
-  const sectionLabels = [...cleanChannels.map(c => CHANNELS[c].label), ...cleanTopics];
-  const epId = id('ep');
-  const ep = {
-    id: epId, mode: 'brief', userId: user.id, status: 'generating',
-    title: 'Your Brief — ' + new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-    topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId,
-    preferredSources: prefIds,
-    segments: [], sources: [], createdAt: now(),
-  };
-  await store.saveEpisode(ep);
-  const run = (async () => {
-    try {
-      ep.sources = await retrieveAll(cleanTopics, cleanChannels, window);
-      // Preferred-source pass (additive). Lead with trusted outlets' reporting.
-      // Any failure/empty result leaves the normal sources untouched. Hard-capped
-      // at 20s total so a slow news API can never hang the episode — if it can't
-      // finish in time, we silently continue with the normal sources.
-      let preferredLabels = [];
-      if (hasPreferred) {
-        preferredLabels = prefIds.map(pid => (PUBLISHERS_BY_ID[pid] || {}).label).filter(Boolean);
-        try {
-          const preferredWork = (async () => {
-            const preferred = await fetchPreferredSources(sectionLabels, prefIds, window);
-            if (preferred.length) {
-              await Promise.all(preferred.slice(0, 3).map(async (s) => { s.fullText = await enrichArticle(s.url); }));
-              ep.sources = dedupeSources([...preferred, ...ep.sources]).slice(0, 40);
-            }
-          })();
-          const cap = new Promise((resolve) => setTimeout(() => resolve('timeout'), 20000));
-          const outcome = await Promise.race([preferredWork.then(() => 'done'), cap]);
-          if (outcome === 'timeout') console.log('preferred-source pass exceeded 20s — continuing with normal sources');
-        } catch (e) { console.log('preferred-source pass failed (continuing):', e.message); }
-      }
-      await store.updateEpisode(ep);
-      const script = await writeBriefScript(sectionLabels, window, ep.sources, lengthMin, voiceId, preferredLabels);
-      await generateEpisodeSegments(ep, script);
-      await store.addToLibrary({ type: 'brief', id: epId, title: ep.title, createdAt: ep.createdAt, userId: user.id });
-      // Populate the popular-combo cache for shared, topic-free combos so the
-      // next user requesting the same combo gets an instant cached result.
-      if (!cleanTopics.length && cleanChannels.length && !hasPreferred && ep.status === 'ready') {
-        popularComboCache.set(comboKey(cleanChannels, lengthMin), { at: Date.now(), episode: ep });
-      }
-    } catch (e) {
-      ep.status = 'failed'; ep.error = e.message;
-      await store.updateEpisode(ep);
-      console.log('brief pipeline failed:', e.message);
-    }
-  })();
-  if (opts && opts.await) await run;
-  return ep;
+  const final = Buffer.concat(buffers);
+  fs.writeFileSync(outPath, final);
+  // ~160 wpm spoken => words/2.67 = seconds
+  const durationSec = Math.round(spoken.split(/\s+/).filter(Boolean).length / 2.67);
+  return { bytes: final.length, durationSec };
 }
 
-/* =========================================================================
-   SCHEDULER — pre-generates Pro users' briefs ahead of their chosen times,
-   in their timezone, so the episode is ready when they open the app.
-   A tick runs every minute. For each schedule, if the user is still Pro and
-   the local time is within the run window for a scheduled time (and it hasn't
-   already run today), it kicks off a brief. The episode generates in the
-   background (fast-start applies), and the schedule records the episode id so
-   the app can surface "your brief is ready" via GET /api/today.
-   ========================================================================= */
-const SCHED_LEAD_MIN = 10;   // start up to 10 min before the target time
-const SCHED_WINDOW_MIN = 60; // ...and still catch up to 60 min after (if worker was down)
+/* =============================================================================
+   THE NIGHTLY BATCH — generate the catalog once; everyone shares it.
+   ========================================================================== */
+function cycleDate() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: process.env.BATCH_TZ || 'America/New_York' });
+}
+const SEGMENT_MIN = Number(process.env.SEGMENT_MIN || 4); // minutes per topic segment
 
-function localParts(tz) {
+async function generateTopic(topic, date) {
+  const t0 = Date.now();
   try {
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz || 'America/New_York', hour12: false,
-      year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-    });
-    const p = Object.fromEntries(fmt.formatToParts(new Date()).map(x => [x.type, x.value]));
-    let hour = parseInt(p.hour, 10); if (hour === 24) hour = 0;
-    return { date: p.year + '-' + p.month + '-' + p.day, minutesOfDay: hour * 60 + parseInt(p.minute, 10) };
+    const { items, windowUsed, thin } = await retrieveRobust(topic);
+    if (!items.length) {
+      await pool.query(
+        `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, script, sources, story_count, status)
+         VALUES ($1,$2,'-','','', '[]', 0, 'failed')
+         ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET status='failed', story_count=0`,
+        [topic.id, date]);
+      console.error('[FAILED] ' + topic.id + ' — zero sources after full escalation');
+      return { topic: topic.id, status: 'failed', stories: 0 };
+    }
+    const script = await writeSegmentScript(topic, items, SEGMENT_MIN);
+    if (!script || script.length < 80) throw new Error('script too short');
+
+    const sources = items.slice(0, 12).map(s => ({
+      publisher: s.publisher, title: s.title, url: s.url, publishedAt: s.publishedAt,
+    }));
+    const dir = path.join(AUDIO_DIR, topic.id, date);
+    fs.mkdirSync(dir, { recursive: true });
+
+    for (const voice of Object.keys(VOICES)) {
+      const out = path.join(dir, voice + '.mp3');
+      const { durationSec } = await synthesizeToFile(script, voice, out);
+      await pool.query(
+        `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, duration_sec, script, sources, story_count, status)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET
+           audio_path=$4, duration_sec=$5, script=$6, sources=$7, story_count=$8, status=$9`,
+        [topic.id, date, voice, '/audio/' + topic.id + '/' + date + '/' + voice + '.mp3',
+         durationSec, script, JSON.stringify(sources), items.length, thin ? 'thin' : 'ok']);
+    }
+    console.log('[OK] ' + topic.id + ' stories=' + items.length + ' window=' + windowUsed + 'h ' +
+                (thin ? 'THIN ' : '') + ((Date.now() - t0) / 1000).toFixed(1) + 's');
+    return { topic: topic.id, status: thin ? 'thin' : 'ok', stories: items.length };
   } catch (e) {
-    const d = new Date();
-    return { date: d.toISOString().slice(0, 10), minutesOfDay: d.getUTCHours() * 60 + d.getUTCMinutes() };
+    console.error('[FAILED] ' + topic.id + ':', e.message);
+    // Failure isolation: yesterday's segment stays servable. Never abort the batch.
+    return { topic: topic.id, status: 'failed', error: e.message };
   }
 }
 
-function dueTimes(schedule, lp) {
-  const due = [];
-  for (const t of schedule.times || []) {
-    const [hh, mm] = String(t).split(':').map(Number);
-    const target = (hh || 0) * 60 + (mm || 0);
-    const already = (schedule.lastRuns || {})[t] === lp.date;
-    if (!already && lp.minutesOfDay >= target - SCHED_LEAD_MIN && lp.minutesOfDay <= target + SCHED_WINDOW_MIN) {
-      due.push(t);
-    }
-  }
-  return due;
+async function runBatch() {
+  const date = cycleDate();
+  console.log('=== BATCH START ' + date + ' ===');
+  const { rows: topics } = await pool.query('SELECT * FROM topics WHERE is_live = true');
+  const results = await Promise.all(topics.map(t => genLimit(() => generateTopic(t, date))));
+
+  // Assemble every user's brief from the fresh catalog
+  const { rows: briefs } = await pool.query('SELECT * FROM user_briefs');
+  for (const b of briefs) { try { await assembleBrief(b, date); } catch (e) { console.error('assemble ' + b.user_id, e.message); } }
+
+  await pruneOldSegments();
+  await retireDeadTopics();
+
+  const ok = results.filter(r => r.status === 'ok').length;
+  const thin = results.filter(r => r.status === 'thin').length;
+  const failed = results.filter(r => r.status === 'failed').length;
+  console.log('=== BATCH DONE — ok=' + ok + ' thin=' + thin + ' failed=' + failed +
+              ' users=' + briefs.length + ' ===');
+  if (thin || failed) console.warn('ATTENTION: ' + (thin + failed) + ' topic(s) need source work');
+  return { date, ok, thin, failed, results };
 }
 
-async function tickSchedules() {
-  const all = await store.listAllSchedules();
-  for (const sc of all) {
-    const user = await store.getUser(sc.userId);
-    if (!user || TIER_RANK[user.tier] < TIER_RANK['pro']) continue; // Pro-only; skip if downgraded
-    const lp = localParts(sc.timezone);
-    for (const t of dueTimes(sc, lp)) {
-      try {
-        const ep = await buildBriefEpisode(user, sc.config, { await: false });
-        sc.lastRuns = Object.assign({}, sc.lastRuns, { [t]: lp.date });
-        sc.lastEpisodeId = ep.id;
-        sc.lastGeneratedDate = lp.date;
-        await store.saveSchedule(sc);
-        console.log('scheduled brief generated:', sc.userId, t, '->', ep.id);
-      } catch (e) {
-        console.log('schedule run failed:', e.message);
-      }
+async function pruneOldSegments() {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT cycle_date FROM segments ORDER BY cycle_date DESC OFFSET $1`, [CATALOG_RETAIN_CYCLES]);
+  for (const r of rows) {
+    await pool.query('DELETE FROM segments WHERE cycle_date=$1', [r.cycle_date]);
+    const d = new Date(r.cycle_date).toISOString().slice(0, 10);
+    for (const t of fs.existsSync(AUDIO_DIR) ? fs.readdirSync(AUDIO_DIR) : []) {
+      const p = path.join(AUDIO_DIR, t, d);
+      if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
     }
   }
 }
-
-/* =========================================================================
-   ENDPOINTS
-   ========================================================================= */
-
-app.get('/api/health', (req, res) => { bumpNewsdataDay(); res.json({ ok: true, version: 'v9.32', mock: MOCK_MODE, db: USE_DB, newsdata: { configured: !!NEWSDATA_API_KEY, callsToday: newsdataStats.callsToday, quotaHitsToday: newsdataStats.quotaHitsToday } }); });
-
-// One-shot TTS probe: synthesizes a tiny clip so you can verify the ElevenLabs
-// key/credits without generating a whole episode. Returns the exact failure
-// reason if it fails. Gated behind ADMIN_TOKEN when one is configured.
-app.get('/api/diag/tts', async (req, res) => {
-  if (ADMIN_TOKEN && req.headers['x-admin-token'] !== ADMIN_TOKEN)
-    return res.status(401).json({ error: 'admin token required' });
-  if (MOCK_MODE) return res.json({ ok: true, mock: true, note: 'MOCK_MODE active — no real keys set, so synthesis is placeholder.' });
-  try {
-    const { bytes } = await synthesizeToFile('This is a test.', 'dave');
-    res.json({ ok: true, bytes, note: 'ElevenLabs synthesized successfully — key and credits are good.' });
-  } catch (e) {
-    const cls = classifyTtsError(e.message);
-    res.json({ ok: false, code: cls.code, reason: cls.label, detail: String(e.message).slice(0, 300) });
-  }
-});
-
-app.get('/api/voices', (req, res) => {
-  res.json({
-    voices: Object.entries(VOICES).map(([key, v]) => {
-      const previewFile = 'preview_' + v.id + '.mp3';
-      const hasPreview = fs.existsSync(path.join(AUDIO_DIR, previewFile));
-      return {
-        id: key, displayName: v.displayName, gender: v.gender, tier: v.tier,
-        description: v.description || (v.gender === 'female' ? 'Female narrator' : 'Male narrator'),
-        preview_url: hasPreview ? absolute('/audio/' + previewFile) : null,
-      };
-    }),
-  });
-});
-
-// Curated channels for the preset tiles (id + label). The app sends selected
-// ids in the `channels` array of POST /api/brief.
-app.get('/api/channels', (req, res) => {
-  res.json({ channels: Object.entries(CHANNELS).map(([id, c]) => ({ id, label: c.label })) });
-});
-
-app.get('/api/publishers', (req, res) => {
-  res.json({ publishers: PUBLISHERS.map(p => ({ id: p.id, label: p.label, domain: p.domain, category: p.category })) });
-});
-
-/* ----- accounts --------------------------------------------------------- */
-// App calls this once on first launch, stores the token, and sends it as
-// "Authorization: Bearer <token>" on every request thereafter.
-app.post('/api/auth/register', async (req, res) => {
-  const u = {
-    id: id('usr'),
-    token: crypto.randomBytes(24).toString('hex'),
-    tier: 'free', gen_count: 0, period_start: periodKey(),
-  };
-  await store.createUser(u);
-  res.json({ userId: u.id, token: u.token, tier: u.tier });
-});
-
-// The app reads this for the "X left this month" counter.
-app.get('/api/me', async (req, res) => {
-  const user = await getReqUser(req);
-  ensurePeriod(user);
-  const lim = limitFor(user.tier);
-  res.json({
-    userId: user.id, tier: user.tier,
-    used: user.gen_count,
-    limit: lim === Infinity ? 'unlimited' : lim,
-    remaining: lim === Infinity ? 'unlimited' : Math.max(0, lim - user.gen_count),
-    resetsMonthly: true,
-  });
-});
-
-// Billing seam: RevenueCat/Stripe (or you, manually) set a user's tier here.
-/* ----- billing/refresh — app calls this on launch to sync Pro status ------- */
-app.post('/api/billing/refresh', async (req, res) => {
-  const user = await getReqUser(req);
-  // Developer accounts are always Pro — never let RevenueCat overwrite this
-  if (DEVELOPER_IDS.includes(user.id)) {
-    return res.json({ userId: user.id, tier: 'pro', synced: true, note: 'developer account' });
-  }
-  const { appUserId } = req.body || {};
-  const rcUserId = appUserId || user.id;
-  const RC_SECRET = process.env.REVENUECAT_SECRET_KEY || '';
-  if (!RC_SECRET) {
-    return res.json({ userId: user.id, tier: user.tier, synced: false, note: 'REVENUECAT_SECRET_KEY not configured' });
-  }
-  try {
-    const rcRes = await fetchWithRetry(
-      'https://api.revenuecat.com/v1/subscribers/' + encodeURIComponent(rcUserId),
-      { headers: { 'Authorization': 'Bearer ' + RC_SECRET, 'Content-Type': 'application/json' } },
-      { tries: 2, timeoutMs: 10000 }
-    );
-    if (!rcRes.ok) {
-      console.log('billing/refresh: RC lookup failed', rcRes.status, rcUserId);
-      return res.json({ userId: user.id, tier: user.tier, synced: false });
-    }
-    const rcData = await rcRes.json();
-    const entitlements = (rcData.subscriber || {}).entitlements || {};
-    const nowIso = new Date().toISOString();
-    let tier = 'free';
-    if (entitlements['pro'] && entitlements['pro'].expires_date > nowIso) tier = 'pro';
-    else if (entitlements['plus'] && entitlements['plus'].expires_date > nowIso) tier = 'plus';
-    if (tier !== user.tier) {
-      await setUserTier(user.id, tier);
-      console.log('billing/refresh: ' + rcUserId + ' -> ' + tier);
-    }
-    res.json({ userId: user.id, tier, synced: true });
-  } catch (e) {
-    console.error('billing/refresh error:', e.message);
-    res.json({ userId: user.id, tier: user.tier, synced: false, error: e.message });
-  }
-});
-
-app.post('/api/admin/set-tier', async (req, res) => {
-  if (!ADMIN_TOKEN || req.headers['x-admin-token'] !== ADMIN_TOKEN)
-    return res.status(403).json({ error: 'forbidden' });
-  const { userId, tier } = req.body || {};
-  if (!['free', 'plus', 'pro'].includes(tier)) return res.status(400).json({ error: 'bad tier' });
-  const ok = await setUserTier(userId, tier);
-  if (!ok) return res.status(404).json({ error: 'no such user' });
-  res.json({ userId, tier });
-});
-
-/* RevenueCat webhook — billing source of truth. The app must set RevenueCat's
-   appUserID to the MyCast user.id (the one from /api/auth/register) so events
-   map to the right account. Configure the webhook URL + Authorization header in
-   RevenueCat, and set REVENUECAT_WEBHOOK_TOKEN to that same value. Always 200s
-   (even on no-op/user-not-found) so RevenueCat doesn't retry forever. */
-app.get('/api/revenuecat/webhook', (req, res) => res.json({ ok: true, service: 'MyCast RevenueCat webhook' }));
-app.post('/api/revenuecat/webhook', async (req, res) => {
-  if (REVENUECAT_WEBHOOK_TOKEN) {
-    const auth = req.headers['authorization'] || '';
-    if (auth !== REVENUECAT_WEBHOOK_TOKEN && auth !== 'Bearer ' + REVENUECAT_WEBHOOK_TOKEN)
-      return res.status(401).json({ error: 'unauthorized' });
-  }
-  const ev = (req.body && req.body.event) || {};
-  const type = ev.type || '';
-  // Collect every id RevenueCat ties to this subscriber and prefer the real
-  // usr_ account id, so a purchase still matches even if the primary
-  // app_user_id arrived as an anonymous ($RCAnonymousID) value.
-  const candidates = []
-    .concat(ev.app_user_id ? [ev.app_user_id] : [])
-    .concat(Array.isArray(ev.aliases) ? ev.aliases : [])
-    .concat(ev.original_app_user_id ? [ev.original_app_user_id] : [])
-    .filter((v, i, a) => v && a.indexOf(v) === i)
-    .sort((a, b) => (String(b).startsWith('usr_') ? 1 : 0) - (String(a).startsWith('usr_') ? 1 : 0));
-  const userId = candidates[0];
-  if (!userId) return res.json({ ok: true, ignored: 'no app_user_id' });
-
-  let tier = null;
-  switch (type) {
-    case 'INITIAL_PURCHASE':
-    case 'RENEWAL':
-    case 'UNCANCELLATION':
-    case 'PRODUCT_CHANGE':
-    case 'NON_RENEWING_PURCHASE':
-      tier = tierFromRevenueCat(ev); break;
-    case 'EXPIRATION':
-      tier = 'free'; break;                 // access actually ended -> downgrade
-    case 'CANCELLATION':                     // auto-renew off, still has access until expiry
-    case 'BILLING_ISSUE':                    // grace period — don't yank access yet
-    default:
-      tier = null; break;                    // no tier change
-  }
-
-  if (!tier) {
-    console.log('revenuecat ' + type + ' -> no tier change (' + userId + ')');
-    return res.json({ ok: true, type, tier: 'unchanged' });
-  }
-  let applied = false, appliedId = null;
-  for (const id of candidates) {
-    if (await setUserTier(id, tier)) { applied = true; appliedId = id; break; }
-  }
-  console.log('revenuecat ' + type + ' -> ' + (appliedId || userId) + ' tier=' + tier + (applied ? '' : ' (user not found; tried: ' + candidates.join(', ') + ')'));
-  res.json({ ok: true, type, userId: appliedId || userId, tier, applied });
-});
-
-/* ----- GET BRIEFED ------------------------------------------------------ */
-app.post('/api/brief', async (req, res) => {
-  const { topics = [], channels = [], window = '24h', lengthMin = 10, voiceId = 'dave', preferredSources = [] } = req.body || {};
-  const cleanTopics = topics.map(t => String(t).trim()).filter(Boolean).slice(0, 10);
-  const cleanChannels = (channels || []).filter(c => CHANNELS[c]).slice(0, 10);
-  if (!cleanTopics.length && !cleanChannels.length) return res.status(400).json({ error: 'Add at least one topic or channel.' });
-  if (!WINDOW_HOURS[window]) return res.status(400).json({ error: 'Invalid window.' });
-
-  const user = await getReqUser(req);
-  if (!voiceAllowed(user, voiceId))
-    return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
-  if (!lengthAllowed(user, lengthMin))
-    return res.status(403).json({ error: 'length_locked', message: lengthMin + '-minute episodes need ' + (tierForLength(lengthMin) === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: tierForLength(lengthMin), maxLengthMin: maxLenForTier(user.tier) });
-  if (!(await reserveGeneration(user, 1)))
-    return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
-
-  const ep = await buildBriefEpisode(user, { topics: cleanTopics, channels: cleanChannels, window, lengthMin, voiceId, preferredSources: Array.isArray(preferredSources) ? preferredSources : [] });
-  res.json({ episodeId: ep.id, status: ep.status });
-});
-
-/* ----- DEEP DIVE -------------------------------------------------------- */
-/* Evergreen deep-dive reuse -------------------------------------------------
-   Deep dives are general knowledge and expensive to synthesize. We tag each
-   finished series with a normalized signature and clone a matching one for the
-   next user instead of regenerating — reusing the already-synthesized (and
-   content-addressed) audio files. Zero LLM, zero TTS, instant, frontend-blind. */
-function normTopic(s) {
-  return String(s || '').toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, ' ').trim();
-}
-function deepdiveSig(topic, depth, lengthMin, voiceId) {
-  return normTopic(topic) + '|' + depth + '|' + lengthMin + '|' + voiceId;
-}
-async function cloneSeriesForUser(src, user) {
-  const newSerId = id('ser');
-  const episodes = [];
-  for (const ref of src.episodes) {
-    const srcEp = await store.getEpisode(ref.id);
-    if (!srcEp) continue;
-    const copy = JSON.parse(JSON.stringify(srcEp));
-    copy.id = id('ep'); copy.userId = user.id; copy.seriesId = newSerId; copy.createdAt = now();
-    await store.saveEpisode(copy);
-    episodes.push({ id: copy.id, index: copy.index, title: copy.title, status: copy.status });
-  }
-  const newSeries = JSON.parse(JSON.stringify(src));
-  newSeries.id = newSerId; newSeries.userId = user.id; newSeries.episodes = episodes;
-  newSeries.createdAt = now(); newSeries.clonedFrom = src.id;
-  delete newSeries.sig; delete newSeries.reusable; // the clone is not itself a template
-  await store.saveSeries(newSeries);
-  await store.addToLibrary({ type: 'deepdive', id: newSerId, title: newSeries.topic, createdAt: newSeries.createdAt, userId: user.id });
-  return newSeries;
+// Only generate topics somebody actually listens to. Categories always stay live.
+async function retireDeadTopics() {
+  const { rowCount } = await pool.query(
+    `UPDATE topics SET is_live=false WHERE kind <> 'category' AND subscriber_count <= 0 AND is_live=true`);
+  if (rowCount) console.log('retired ' + rowCount + ' dead topic(s)');
 }
 
-app.post('/api/deepdive', async (req, res) => {
-  const { topic, depth = 'conversational', episodeLengthMin = 20, voiceId = 'dave' } = req.body || {};
-  const t = String(topic || '').trim();
-  if (!t) return res.status(400).json({ error: 'Enter a topic.' });
-  if (!DEPTH[depth]) return res.status(400).json({ error: 'Invalid depth.' });
+/* =============================================================================
+   ASSEMBLY — a brief is a MANIFEST of shared segments. Cost to serve ~= $0.
+   ========================================================================== */
+async function assembleBrief(brief, date) {
+  const topicIds = brief.topic_ids || [];
+  if (!topicIds.length) return null;
+  const voice = brief.voice || DEFAULT_VOICE;
+  const budgetSec = (brief.length_min || FREE_MAX_LEN) * 60;
 
-  const user = await getReqUser(req);
-  if (!voiceAllowed(user, voiceId))
-    return res.status(403).json({ error: 'voice_locked', message: 'That voice needs a paid plan.' });
-  if (!lengthAllowed(user, episodeLengthMin))
-    return res.status(403).json({ error: 'length_locked', message: episodeLengthMin + '-minute episodes need ' + (tierForLength(episodeLengthMin) === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: tierForLength(episodeLengthMin), maxLengthMin: maxLenForTier(user.tier) });
-  const depthMinTier = depth === 'black_belt' ? BLACK_BELT_MIN_TIER : (depth === 'well_versed' ? WELL_VERSED_MIN_TIER : 'free');
-  if (TIER_RANK[user.tier] < TIER_RANK[depthMinTier])
-    return res.status(403).json({ error: 'depth_locked', message: DEPTH[depth].label + ' needs ' + (depthMinTier === 'pro' ? 'Pro' : 'Plus') + '.', tier: user.tier, requiredTier: depthMinTier, depth });
-  if (!(await reserveGeneration(user, DEEPDIVE_COUNTS_AS)))
-    return res.status(402).json({ error: 'limit_reached', message: 'Monthly limit reached.', tier: user.tier });
+  const { rows: segs } = await pool.query(
+    `SELECT DISTINCT ON (topic_id) s.*, t.label
+       FROM segments s JOIN topics t ON t.id = s.topic_id
+      WHERE s.topic_id = ANY($1) AND s.voice = $2 AND s.status <> 'failed'
+      ORDER BY topic_id, cycle_date DESC`,
+    [topicIds, voice]);
 
-  // Evergreen reuse: if an identical series already exists, clone it (no LLM/TTS).
-  const sig = deepdiveSig(t, depth, episodeLengthMin, voiceId);
-  const shared = await store.findSharedSeries(sig);
-  if (shared) {
-    const cloned = await cloneSeriesForUser(shared, user);
-    console.log('deepdive cache HIT [' + sig + '] -> cloned ' + cloned.id);
-    return res.json({ seriesId: cloned.id, firstEpisodeId: cloned.episodes[0].id, plannedEpisodes: cloned.episodes, cached: true });
-  }
+  const byId = {}; for (const s of segs) byId[s.topic_id] = s;
+  const ordered = topicIds.map(id => byId[id]).filter(Boolean); // §4.6: skip missing, don't say "no news"
+  if (!ordered.length) return null;
 
-  const serId = id('ser');
-  const series = {
-    id: serId, userId: user.id, topic: t, depth, episodeLengthMin, voiceId,
-    label: DEPTH[depth].label, episodes: [], createdAt: now(), status: 'planning', sig,
-  };
-  await store.saveSeries(series);
+  // Proportional trim to the user's budget. Segments are inverted-pyramid, so a
+  // trim from the end stays coherent.
+  const totalSec = ordered.reduce((a, s) => a + (s.duration_sec || 0), 0);
+  const scale = totalSec > budgetSec ? budgetSec / totalSec : 1;
 
-  let titles;
-  try { titles = await writeDeepDivePlan(t, depth); }
-  catch (e) { return res.status(500).json({ error: 'Planning failed: ' + e.message }); }
-
-  // create episode shells
-  series.episodes = [];
-  for (let i = 0; i < titles.length; i++) {
-    const epId = id('ep');
-    const ep = {
-      id: epId, mode: 'deepdive', userId: user.id, seriesId: serId, index: i + 1, title: titles[i],
-      status: 'queued', voiceId, lengthMin: episodeLengthMin,
-      segments: [], sources: [], createdAt: now(),
-    };
-    await store.saveEpisode(ep);
-    series.episodes.push({ id: epId, index: i + 1, title: titles[i], status: 'queued' });
-  }
-  series.status = 'generating';
-  await store.updateSeries(series);
-  const firstId = series.episodes[0].id;
-  res.json({ seriesId: serId, firstEpisodeId: firstId, plannedEpisodes: series.episodes });
-
-  // generate episode 1 first (fast start), then the rest in the background
-  (async () => {
-    const refs = await retrieveReferences(t);     // real, citable grounding for the whole series
-    series.sources = refs;
-    await store.updateSeries(series);
-    for (let i = 0; i < series.episodes.length; i++) {
-      const ref = series.episodes[i];
-      const ep = await store.getEpisode(ref.id);
-      ep.status = 'generating'; ref.status = 'generating';
-      ep.sources = refs;                          // show the references on each episode
-      await store.updateSeries(series);
-      try {
-        const priorTitles = series.episodes.slice(0, i).map(e => e.title);
-        const script = await writeEpisodeScript(t, ep.title, episodeLengthMin, (i + 1) + ' of ' + series.episodes.length, refs, priorTitles);
-        await generateEpisodeSegments(ep, script);
-        ref.status = ep.status;
-      } catch (e) {
-        ep.status = 'failed'; ep.error = e.message; ref.status = 'failed';
-        await store.updateEpisode(ep);
-        console.log('deepdive episode failed:', e.message);
-      }
-      await store.updateSeries(series);
-    }
-    series.status = 'complete';
-    // Only a fully-successful series becomes a reusable template (never cache a
-    // series whose audio failed — e.g. a TTS-quota outage).
-    const allEps = await Promise.all(series.episodes.map(r => store.getEpisode(r.id)));
-    series.reusable = allEps.every(e => e && e.status === 'complete'
-      && e.segments.length > 0 && e.segments.every(s => s.status === 'ready'));
-    await store.updateSeries(series);
-    await store.addToLibrary({ type: 'deepdive', id: serId, title: t, createdAt: series.createdAt, userId: user.id });
-  })();
-});
-
-/* ----- manifests (player polls these) ----------------------------------- */
-app.get('/api/episode/:id/manifest', async (req, res) => {
-  const user = await getReqUser(req);
-  const ep = await store.getEpisode(req.params.id);
-  if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
-  res.json(ep);
-});
-
-/* ----- per-episode regenerate (app's "Tap to retry") -------------------- */
-app.post('/api/episode/:id/regenerate', async (req, res) => {
-  const user = await getReqUser(req);
-  const ep = await store.getEpisode(req.params.id);
-  if (!ep || (ep.userId && ep.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
-  if (ep.status === 'generating' || ep.status === 'queued') {
-    return res.json({ status: ep.status, note: 'Already in progress' });
-  }
-  // Reset episode state
-  ep.status = 'queued';
-  ep.segments = [];
-  ep.error = undefined;
-  ep.errorCode = undefined;
-  await store.updateEpisode(ep);
-  res.json({ status: 'queued' });
-  // Re-run generation in the background using the episode's existing metadata
-  (async () => {
-    try {
-      ep.status = 'generating';
-      await store.updateEpisode(ep);
-      // Get series context for the script prompt
-      const series = ep.seriesId ? await store.getSeries(ep.seriesId) : null;
-      const seriesTopic = series ? series.topic : ep.title;
-      const refs = ep.sources && ep.sources.length ? ep.sources : await retrieveReferences(seriesTopic);
-      const totalEps = series ? series.episodes.length : 1;
-      const priorTitles = series
-        ? series.episodes.filter(e => e.index < ep.index).map(e => e.title)
-        : [];
-      const script = await writeEpisodeScript(
-        seriesTopic, ep.title, ep.lengthMin || 10,
-        ep.index + ' of ' + totalEps, refs, priorTitles
-      );
-      await generateEpisodeSegments(ep, script);
-      // Update series episode status if part of a series
-      if (series) {
-        const ref = series.episodes.find(e => e.id === ep.id);
-        if (ref) { ref.status = ep.status; await store.updateSeries(series); }
-      }
-    } catch (e) {
-      ep.status = 'failed'; ep.error = e.message;
-      await store.updateEpisode(ep);
-      console.log('regenerate failed for', ep.id, ':', e.message);
-    }
-  })();
-});
-
-app.get('/api/series/:id', async (req, res) => {
-  const user = await getReqUser(req);
-  const s = await store.getSeries(req.params.id);
-  if (!s || (s.userId && s.userId !== user.id)) return res.status(404).json({ error: 'Not found' });
-  res.json(s);
-});
-
-/* ----- library ---------------------------------------------------------- */
-app.get('/api/library', async (req, res) => {
-  const user = await getReqUser(req);
-  res.json({ items: await store.getLibrary(user.id) });
-});
-
-/* ----- scheduling (Pro feature; stored now, pre-gen worker comes next) --- */
-app.post('/api/schedule', async (req, res) => {
-  const user = await getReqUser(req);
-  if (TIER_RANK[user.tier] < TIER_RANK['pro'])
-    return res.status(403).json({ error: 'feature_locked', message: 'Scheduled briefs are a Pro feature.' });
-  const { config, times = ['07:00'], timezone = 'America/New_York' } = req.body || {};
-  const hasTopics = config && Array.isArray(config.topics) && config.topics.length;
-  const hasChannels = config && Array.isArray(config.channels) && config.channels.length;
-  if (!hasTopics && !hasChannels)
-    return res.status(400).json({ error: 'Schedule needs at least one topic or channel.' });
-  const sId = id('sch');
-  const sched = { id: sId, userId: user.id, config, times, timezone, createdAt: now() };
-  await store.saveSchedule(sched);
-  res.json(sched);
-});
-app.get('/api/schedule', async (req, res) => {
-  const user = await getReqUser(req);
-  const raw = await store.listSchedules(user.id);
-  const schedules = raw.map(sc => ({
-    id: sc.id,
-    config: sc.config || {},
-    times: sc.times || ['07:00'],
-    timezone: sc.timezone || 'America/New_York',
-    lastEpisodeId: sc.lastEpisodeId || null,
-    lastGeneratedDate: sc.lastGeneratedDate || null,
-    createdAt: sc.createdAt,
+  const items = ordered.map(s => ({
+    topic_id: s.topic_id,
+    label: s.label,
+    url: absolute(s.audio_path),
+    duration_sec: s.duration_sec,
+    play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)), // trim point
+    sources: s.sources || [],
+    status: s.status,
   }));
-  res.json({ schedules });
-});
-app.delete('/api/schedule/:id', async (req, res) => {
-  const user = await getReqUser(req);
-  const ok = await store.deleteSchedule(req.params.id, user.id);
-  if (!ok) return res.status(404).json({ error: 'Not found' });
-  res.json({ deleted: true, id: req.params.id });
-});
 
-// The app calls this on open to surface a pre-generated brief ("ready to play").
-app.get('/api/today', async (req, res) => {
-  const user = await getReqUser(req);
-  const scheds = await store.listSchedules(user.id);
-  let episodeId = null;
-  for (const sc of scheds) {
-    const today = localParts(sc.timezone).date;
-    if (sc.lastGeneratedDate === today && sc.lastEpisodeId) episodeId = sc.lastEpisodeId;
-  }
-  if (!episodeId) return res.json({ ready: false });
-  const ep = await store.getEpisode(episodeId);
-  res.json({ ready: true, episodeId, status: ep ? ep.status : 'unknown' });
-});
-
-/* ----- fallback (serve a frontend if one exists) ------------------------ */
-app.get(/^(?!\/api|\/audio).*$/, (req, res) => {
-  const indexHtml = path.join(__dirname, 'public', 'index.html');
-  if (fs.existsSync(indexHtml)) return res.sendFile(indexHtml);
-  res.json({ ok: true, service: 'MyCast backend v9', mock: MOCK_MODE });
-});
-
-const PORT = process.env.PORT || 3000;
-/* ---- 6-hour pre-generation job for popular Rundown combos ---------------- */
-const PRE_GEN_INTERVAL_MS = 6 * 3600 * 1000; // every 6 hours — keeps news fresh
-const PRE_GEN_TOP_N = 15; // pre-generate the top N most-requested combos
-
-async function preGeneratePopularCombos() {
-  const combos = getPopularCombos(PRE_GEN_TOP_N);
-  if (!combos.length) { console.log('pre-gen: no popular combos tracked yet'); return; }
-  console.log('pre-gen: warming cache for', combos.length, 'popular combos');
-  // Use the developer/system user so these don't count against any real
-  // user's monthly generation limit.
-  let sysUser = await store.getUser('system');
-  if (!sysUser) sysUser = await store.createUser({ id: 'system', token: 'system', tier: 'pro', gen_count: 0, period_start: periodKey() });
-  for (const combo of combos) {
-    try {
-      // Always regenerate on each pre-gen cycle so cached content reflects
-      // the latest news rather than serving a stale 6-hour-old cache hit.
-      console.log('pre-gen: generating', comboKey(combo.channels, combo.lengthMin), '(', combo.count, 'requests)');
-      await buildBriefEpisode(sysUser, { channels: combo.channels, topics: [], window: '24h', lengthMin: combo.lengthMin, voiceId: 'dave' }, { await: true });
-    } catch (e) {
-      console.log('pre-gen failed for combo', comboKey(combo.channels, combo.lengthMin), ':', e.message);
-    }
-  }
-  console.log('pre-gen: cycle complete');
+  const manifest = {
+    date,
+    voice,
+    intro: 'Good morning. It\'s ' + new Date(date + 'T12:00:00Z').toLocaleDateString('en-US',
+      { weekday: 'long', month: 'long', day: 'numeric' }) + '. Here\'s your brief.',
+    items,
+  };
+  const total = items.reduce((a, i) => a + i.play_sec, 0);
+  await pool.query(
+    `INSERT INTO daily_briefs (user_id, cycle_date, manifest, total_sec) VALUES ($1,$2,$3,$4)
+     ON CONFLICT (user_id, cycle_date) DO UPDATE SET manifest=$3, total_sec=$4`,
+    [brief.user_id, date, JSON.stringify(manifest), total]);
+  return manifest;
 }
 
-if (require.main === module) {
-  // One-time voice preview generation. Idempotent: skips any preview clip that
-  // already exists on the (persistent) volume, so real ElevenLabs billing only
-  // happens once. Runs non-blocking after boot; logs success/failure per voice.
-  const PREVIEW_SCRIPT = "Good morning. Markets opened higher today, with the S&P 500 up half a percent. In tech, a major breakthrough — and why it actually matters for you. That's your briefing. Let's dive in.";
-  async function generateVoicePreviews() {
-    for (const [key, v] of Object.entries(VOICES)) {
-      const fileName = 'preview_' + v.id + '.mp3';
-      const filePath = path.join(AUDIO_DIR, fileName);
-      if (fs.existsSync(filePath)) { console.log('[preview] exists, skipping: ' + key); continue; }
-      if (MOCK_MODE || !EK) { console.log('[preview] skipped (no ElevenLabs key / mock mode): ' + key); continue; }
-      try {
-        const r = await ttsLimit(() => fetchWithRetry('https://api.elevenlabs.io/v1/text-to-speech/' + v.id, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'xi-api-key': EK },
-          body: JSON.stringify({ text: PREVIEW_SCRIPT, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.4, similarity_boost: 0.75 } }),
-        }, { tries: 3, timeoutMs: 45000 }));
-        if (!r.ok) { console.log('[preview] FAILED ' + key + ' (' + v.id + '): ' + r.status + ' ' + (await r.text()).slice(0, 120)); continue; }
-        const buf = Buffer.from(await r.arrayBuffer());
-        fs.writeFileSync(filePath, buf);
-        console.log('[preview] generated: ' + key + ' (' + v.id + ') ' + buf.length + ' bytes');
-      } catch (e) {
-        console.log('[preview] ERROR ' + key + ' (' + v.id + '): ' + e.message);
-      }
-    }
-    console.log('[preview] generation pass complete');
-  }
-
-  initDb()
-    .catch(e => console.log('DB init error (continuing in-memory):', e.message))
-    .finally(() => {
-      app.listen(PORT, () =>
-        console.log('MyCast v9.32 on port ' + PORT
-          + (MOCK_MODE ? ' [MOCK_MODE: no API keys]' : '')
-          + (USE_DB ? ' [Postgres]' : ' [in-memory]')));
-      // scheduler: tick every minute, plus once shortly after boot
-      setInterval(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 60 * 1000);
-      setTimeout(() => tickSchedules().catch(e => console.log('tick error:', e.message)), 5000);
-      // popular-combo pre-generation: every 6 hours, plus once 2 min after boot
-      // (delayed start so there's some real request data to base popularity on)
-      setInterval(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), PRE_GEN_INTERVAL_MS);
-      setTimeout(() => preGeneratePopularCombos().catch(e => console.log('pre-gen tick error:', e.message)), 2 * 60 * 1000);
-      // one-time voice preview generation (idempotent; skips existing clips)
-      setTimeout(() => generateVoicePreviews().catch(e => console.log('preview gen error:', e.message)), 8000);
-    });
+/* =============================================================================
+   TOPIC SUBSCRIPTION + THE FLYWHEEL
+   A custom topic normalizes into the SHARED catalog. The 500th person who wants
+   "Dodgers" costs $0 — they subscribe to the topic the 1st person seeded.
+   ========================================================================== */
+async function subscribeTopic(userId, topicId) {
+  const { rowCount } = await pool.query(
+    'INSERT INTO topic_subscriptions (user_id, topic_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [userId, topicId]);
+  if (rowCount) await pool.query(
+    'UPDATE topics SET subscriber_count = subscriber_count + 1, is_live = true WHERE id=$1', [topicId]);
+}
+async function unsubscribeTopic(userId, topicId) {
+  const { rowCount } = await pool.query(
+    'DELETE FROM topic_subscriptions WHERE user_id=$1 AND topic_id=$2', [userId, topicId]);
+  if (rowCount) await pool.query(
+    'UPDATE topics SET subscriber_count = GREATEST(0, subscriber_count - 1) WHERE id=$1', [topicId]);
 }
 
-// Exported for testing only.
-module.exports = { app, isFinanceTopic, dedupeSources, hostnameOf, retrieveForTopic, retrieveSources,
-  tickSchedules, localParts, dueTimes, buildBriefEpisode, store,
-  makeLimiter, fetchWithRetry, audioKey, synthesizeToFile, getSynthCount: () => synthCount, classifyTtsError, detectSportsTeam, sportsSourceForTopic };
+// Returns { topic, created }. Created topics enter TONIGHT's batch → live tomorrow.
+async function resolveOrCreateTopic(rawLabel) {
+  const normKey = SEED.normalizeTopic(rawLabel);
+  const { rows } = await pool.query('SELECT * FROM topics WHERE norm_key=$1', [normKey]);
+  if (rows[0]) return { topic: rows[0], created: false };   // SHARED — costs nothing
 
-/* =========================================================================
-   PRODUCTION NOTES (not code — read before selling)
-   1. PERSISTENCE: state is in-memory and audio is on ephemeral disk, so the
-      Library is wiped on every redeploy/restart. For a real product, add a
-      database (Railway Postgres → DATABASE_URL) for episode/series/library
-      records, and object storage (Cloudflare R2 / S3) for segment audio.
-   2. SCHEDULING: /api/schedule stores configs but nothing generates them
-      yet. Add a cron worker (e.g. node-cron) that, ahead of each scheduled
-      time per user timezone, runs the brief pipeline so it's ready on open.
-   3. ACCOUNTS + LIMITS + BILLING: there is no auth here, so monthly limits
-      and tier gating are advisory (client passes tier). Real enforcement
-      needs user accounts + a billing provider (e.g. RevenueCat/Stripe).
-   4. CONCURRENCY: generation runs in-process. Fine for early users; move
-      heavy generation to a queue/worker when traffic grows.
-   ========================================================================= */
+  const label = String(rawLabel).trim().slice(0, 60);
+  const id = 'custom_' + SEED.slug(label) + '_' + crypto.randomBytes(2).toString('hex');
+  const queries = [label, label + ' news', label + ' latest', label + ' update'];
+  const { rows: ins } = await pool.query(
+    `INSERT INTO topics (id, kind, label, norm_key, queries, rss_feeds, window_hours, hints, is_live)
+     VALUES ($1,'custom',$2,$3,$4,'[]',48,'{}',true) RETURNING *`,
+    [id, label, normKey, JSON.stringify(queries)]);
+  console.log('NEW standing topic seeded: ' + id + ' (' + normKey + ')');
+  return { topic: ins[0], created: true };
+}
+
+/* =============================================================================
+   ENDPOINTS
+   ========================================================================== */
+app.get('/api/health', async (_req, res) => {
+  let db = false;
+  try { await pool.query('SELECT 1'); db = true; } catch {}
+  res.json({ ok: true, version: VERSION, mock: MOCK_MODE, db, tts_provider: TTS_PROVIDER });
+});
+
+// The pickable menu — categories + the guided-picker taxonomy (no blank box).
+app.get('/api/catalog', async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, label, kind, window_hours FROM topics WHERE kind='category' AND is_live=true ORDER BY label`);
+  res.json({
+    categories: rows,
+    leagues: SEED.TEAM_LEAGUES,
+    cities: SEED.CITIES,
+    follows: SEED.FOLLOW_SEEDS,
+  });
+});
+
+app.get('/api/me', requireUser(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [req.user.id]);
+  res.json({
+    id: req.user.id,
+    tier: req.user.tier,
+    limits: {
+      maxLengthMin: maxLenFor(req.user),
+      maxCategories: isPaid(req.user) ? null : FREE_MAX_CATEGORIES,
+      maxCustom: isPaid(req.user) ? PAID_MAX_CUSTOM : 0,
+    },
+    brief: rows[0] || null,
+  });
+}));
+
+// Set the brief: ordered topics, length, voice, delivery time.
+app.put('/api/brief/config', requireUser(async (req, res) => {
+  const u = req.user;
+  const { topic_ids = [], length_min = FREE_MAX_LEN, voice = DEFAULT_VOICE, deliver_at = null, timezone } = req.body || {};
+  if (!Array.isArray(topic_ids) || !topic_ids.length) return res.status(400).json({ error: 'topics_required' });
+  if (!VOICES[voice]) return res.status(400).json({ error: 'bad_voice' });
+
+  const len = Number(length_min) || FREE_MAX_LEN;
+  if (len > maxLenFor(u))
+    return res.status(403).json({ error: 'length_locked', requiredTier: 'paid', maxLengthMin: maxLenFor(u) });
+  if (!isPaid(u) && topic_ids.length > FREE_MAX_CATEGORIES)
+    return res.status(403).json({ error: 'category_limit', requiredTier: 'paid', max: FREE_MAX_CATEGORIES });
+  if (!isPaid(u) && deliver_at)
+    return res.status(403).json({ error: 'scheduling_locked', requiredTier: 'paid' });
+
+  const { rows: valid } = await pool.query('SELECT id FROM topics WHERE id = ANY($1)', [topic_ids]);
+  const validIds = valid.map(r => r.id);
+  const ordered = topic_ids.filter(id => validIds.includes(id));
+  if (!ordered.length) return res.status(400).json({ error: 'no_valid_topics' });
+
+  const { rows: prev } = await pool.query('SELECT topic_id FROM topic_subscriptions WHERE user_id=$1', [u.id]);
+  for (const p of prev) if (!ordered.includes(p.topic_id)) await unsubscribeTopic(u.id, p.topic_id);
+  for (const id of ordered) await subscribeTopic(u.id, id);
+
+  await pool.query(
+    `INSERT INTO user_briefs (user_id, topic_ids, length_min, voice, deliver_at, timezone, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,now())
+     ON CONFLICT (user_id) DO UPDATE SET
+       topic_ids=$2, length_min=$3, voice=$4, deliver_at=$5, timezone=COALESCE($6, user_briefs.timezone), updated_at=now()`,
+    [u.id, JSON.stringify(ordered), len, voice, deliver_at, timezone || null]);
+
+  // Assemble immediately from the existing catalog so they hear it now.
+  const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [u.id]);
+  const manifest = await assembleBrief(b[0], cycleDate());
+  res.json({ ok: true, topics: ordered, length_min: len, voice, manifest });
+}));
+
+// PAID: add one of up to 3 custom topics. Normalizes into the shared catalog.
+app.post('/api/brief/custom-topic', requireUser(async (req, res) => {
+  const u = req.user;
+  if (!isPaid(u)) return res.status(403).json({ error: 'custom_locked', requiredTier: 'paid' });
+  const label = String((req.body || {}).label || '').trim();
+  if (label.length < 2 || label.length > 60) return res.status(400).json({ error: 'bad_label' });
+
+  const { rows: mine } = await pool.query(
+    `SELECT t.id FROM topic_subscriptions s JOIN topics t ON t.id=s.topic_id
+      WHERE s.user_id=$1 AND t.kind NOT IN ('category')`, [u.id]);
+  if (mine.length >= PAID_MAX_CUSTOM)
+    return res.status(403).json({ error: 'custom_limit', max: PAID_MAX_CUSTOM });
+
+  const { topic, created } = await resolveOrCreateTopic(label);
+  await subscribeTopic(u.id, topic.id);
+
+  const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [u.id]);
+  if (b[0]) {
+    const ids = (b[0].topic_ids || []).concat([topic.id]);
+    await pool.query('UPDATE user_briefs SET topic_ids=$2, updated_at=now() WHERE user_id=$1',
+      [u.id, JSON.stringify([...new Set(ids)])]);
+  }
+  res.json({
+    ok: true, topic: { id: topic.id, label: topic.label },
+    created,
+    // Honest UX contract: a brand-new topic joins tonight's batch.
+    available: created ? 'tomorrow_morning' : 'now',
+    message: created
+      ? 'We\'re adding "' + topic.label + '" — it\'ll be in your brief tomorrow morning.'
+      : '"' + topic.label + '" added to your brief.',
+  });
+}));
+
+app.delete('/api/brief/custom-topic/:id', requireUser(async (req, res) => {
+  await unsubscribeTopic(req.user.id, req.params.id);
+  const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [req.user.id]);
+  if (b[0]) {
+    const ids = (b[0].topic_ids || []).filter(x => x !== req.params.id);
+    await pool.query('UPDATE user_briefs SET topic_ids=$2, updated_at=now() WHERE user_id=$1',
+      [req.user.id, JSON.stringify(ids)]);
+  }
+  res.json({ ok: true });
+}));
+
+// Today's brief: the manifest of shared segments + source links.
+app.get('/api/brief/today', requireUser(async (req, res) => {
+  const date = cycleDate();
+  const { rows } = await pool.query(
+    'SELECT * FROM daily_briefs WHERE user_id=$1 ORDER BY cycle_date DESC LIMIT 1', [req.user.id]);
+  if (rows[0]) return res.json({ ok: true, ...rows[0].manifest, total_sec: rows[0].total_sec, stale: rows[0].cycle_date.toISOString().slice(0,10) !== date });
+
+  const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [req.user.id]);
+  if (!b[0]) return res.status(404).json({ error: 'no_brief_configured' });
+  const manifest = await assembleBrief(b[0], date);
+  if (!manifest) return res.status(503).json({ error: 'catalog_not_ready' });
+  res.json({ ok: true, ...manifest });
+}));
+
+app.use('/audio', express.static(AUDIO_DIR, { maxAge: '7d' }));
+
+/* ---- billing (carried over; RevenueCat identity fix preserved) ----------- */
+function tierFromRevenueCat(ev) {
+  const ents = (ev && ev.entitlement_ids) || [];
+  if (ents.length) return 'paid';
+  return 'free';
+}
+app.post('/api/revenuecat/webhook', async (req, res) => {
+  const auth = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (RC_WEBHOOK && auth !== RC_WEBHOOK) return res.status(403).json({ error: 'forbidden' });
+  const ev = (req.body || {}).event || {};
+  // Prefer a usr_ id from the alias list — the anonymous-ID bug fix.
+  const candidates = [ev.app_user_id, ...(ev.aliases || []), ev.original_app_user_id].filter(Boolean);
+  const target = candidates.find(id => /^usr_/.test(id)) || candidates[0];
+  if (!target) return res.json({ ok: true, skipped: 'no_id' });
+  const tier = tierFromRevenueCat(ev);
+  await pool.query(
+    'INSERT INTO users (id, tier) VALUES ($1,$2) ON CONFLICT (id) DO UPDATE SET tier=$2', [target, tier]);
+  console.log('revenuecat ' + ev.type + ' -> ' + target + ' tier=' + tier);
+  res.json({ ok: true, user: target, tier });
+});
+app.get('/api/revenuecat/webhook', (_req, res) => res.json({ ok: true, note: 'POST expected' }));
+
+app.post('/api/billing/refresh', requireUser(async (req, res) => {
+  if (!RC_SECRET) return res.json({ ok: true, tier: req.user.tier, note: 'no_rc_key' });
+  try {
+    const r = await fetchWithRetry('https://api.revenuecat.com/v1/subscribers/' + encodeURIComponent(req.user.id),
+      { headers: { Authorization: 'Bearer ' + RC_SECRET } }, { tries: 2, timeoutMs: 10000 });
+    const d = await r.json();
+    const ents = ((d.subscriber || {}).entitlements) || {};
+    const active = Object.keys(ents).filter(k => !ents[k].expires_date || new Date(ents[k].expires_date) > new Date());
+    const tier = active.length ? 'paid' : 'free';
+    await pool.query('UPDATE users SET tier=$2 WHERE id=$1', [req.user.id, tier]);
+    res.json({ ok: true, tier });
+  } catch (e) { res.status(502).json({ error: 'rc_failed', message: e.message }); }
+}));
+
+/* ---- admin -------------------------------------------------------------- */
+app.post('/api/admin/batch/run', requireAdmin(async (_req, res) => {
+  res.json({ ok: true, started: true });   // respond immediately; batch runs on
+  runBatch().catch(e => console.error('batch error:', e));  // the server, not the request
+}));
+
+// The health metric that would have caught the Dodgers bug on night one.
+app.get('/api/admin/catalog/health', requireAdmin(async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT ON (s.topic_id) s.topic_id, t.label, t.kind, t.window_hours,
+            s.story_count, s.status, s.cycle_date, t.subscriber_count
+       FROM segments s JOIN topics t ON t.id=s.topic_id
+      ORDER BY s.topic_id, s.cycle_date DESC`);
+  const thin = rows.filter(r => r.status !== 'ok');
+  res.json({
+    cycle: cycleDate(),
+    total: rows.length,
+    ok: rows.filter(r => r.status === 'ok').length,
+    thin: rows.filter(r => r.status === 'thin').length,
+    failed: rows.filter(r => r.status === 'failed').length,
+    needs_attention: thin,
+    topics: rows.sort((a, b) => a.story_count - b.story_count),
+  });
+}));
+
+app.get('/api/admin/topics', requireAdmin(async (_req, res) => {
+  const { rows } = await pool.query(
+    'SELECT id, kind, label, norm_key, window_hours, subscriber_count, is_live FROM topics ORDER BY kind, label');
+  res.json({ count: rows.length, topics: rows });
+}));
+
+app.get('/api/diag/tts', requireAdmin(async (_req, res) => {
+  try {
+    const p = path.join(AUDIO_DIR, '_diag.mp3');
+    const { bytes } = await synthesizeToFile('True Scope text to speech diagnostic. The S&P 500 rose 1.4%.', DEFAULT_VOICE, p);
+    res.json({ ok: true, provider: TTS_PROVIDER, model: TTS_MODEL, bytes });
+  } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
+}));
+
+/* ---- scheduler ---------------------------------------------------------- */
+// Fire the batch once per day at BATCH_HOUR in BATCH_TZ.
+const BATCH_HOUR = Number(process.env.BATCH_HOUR || 3);
+let lastBatchDate = null;
+setInterval(async () => {
+  const tz = process.env.BATCH_TZ || 'America/New_York';
+  const now = new Date();
+  const hour = Number(now.toLocaleString('en-US', { timeZone: tz, hour: 'numeric', hour12: false }));
+  const date = cycleDate();
+  if (hour === BATCH_HOUR && lastBatchDate !== date) {
+    lastBatchDate = date;
+    console.log('scheduled batch firing for ' + date);
+    try { await runBatch(); } catch (e) { console.error('scheduled batch error:', e); }
+  }
+}, 5 * 60 * 1000);
+
+/* ---- boot --------------------------------------------------------------- */
+initDb()
+  .then(() => app.listen(PORT, () => console.log('True Scope ' + VERSION + ' on port ' + PORT +
+    ' (tts=' + TTS_PROVIDER + '/' + TTS_MODEL + (MOCK_MODE ? ', MOCK' : '') + ')')))
+  .catch(e => { console.error('boot failed:', e); process.exit(1); });
+
+module.exports = { app, runBatch, retrieveRobust, normalizeForTTS, assembleBrief, resolveOrCreateTopic, subscribeTopic, pool };
