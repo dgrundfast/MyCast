@@ -1,5 +1,5 @@
 /* =============================================================================
-   TRUE SCOPE — Backend v2.0
+   MYCAST — Backend v2.0
    =============================================================================
    "Set your own daily brief."
 
@@ -1015,7 +1015,7 @@ app.get('/api/admin/voice-sample', requireAdmin(async (req, res) => {
 app.get('/api/diag/tts', requireAdmin(async (_req, res) => {
   try {
     const p = path.join(AUDIO_DIR, '_diag.mp3');
-    const { bytes } = await synthesizeToFile('True Scope text to speech diagnostic. The S&P 500 rose 1.4%.', DEFAULT_VOICE, p);
+    const { bytes } = await synthesizeToFile('MyCast text to speech diagnostic. The S&P 500 rose 1.4%.', DEFAULT_VOICE, p);
     res.json({ ok: true, provider: TTS_PROVIDER, model: TTS_MODEL, bytes });
   } catch (e) { res.status(502).json({ ok: false, error: e.message }); }
 }));
@@ -1038,7 +1038,7 @@ setInterval(async () => {
 
 /* ---- boot --------------------------------------------------------------- */
 initDb()
-  .then(() => app.listen(PORT, () => console.log('True Scope ' + VERSION + ' on port ' + PORT +
+  .then(() => app.listen(PORT, () => console.log('MyCast ' + VERSION + ' on port ' + PORT +
     ' (tts=' + TTS_PROVIDER + '/' + TTS_MODEL + (MOCK_MODE ? ', MOCK' : '') + ')')))
   .catch(e => { console.error('boot failed:', e); process.exit(1); });
 
