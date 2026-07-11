@@ -577,7 +577,11 @@ async function synthesizeToFile(text, voice, outPath) {
 function cycleDate() {
   return new Date().toLocaleDateString('en-CA', { timeZone: process.env.BATCH_TZ || 'America/New_York' });
 }
-const SEGMENT_MIN = Number(process.env.SEGMENT_MIN || 4); // minutes per topic segment
+const SEGMENT_MIN = Number(process.env.SEGMENT_MIN || 10); // CEILING per topic segment.
+// The Wire Editor prompt says "LENGTH IS A CEILING, NOT A QUOTA" — a big World News
+// day fills 10 min; a slow Books day writes 5 and stops. We pay for real news only.
+const MIN_TOPICS_FOR_LONG = Number(process.env.MIN_TOPICS_FOR_LONG || 2);
+const LONG_BRIEF_MIN = Number(process.env.LONG_BRIEF_MIN || 10); // >this needs 2+ topics
 
 async function generateTopic(topic, date, activeVoices) {
   const t0 = Date.now();
@@ -730,6 +734,11 @@ async function assembleBrief(brief, date) {
     items,
   };
   const total = items.reduce((a, i) => a + i.play_sec, 0);
+  // Honesty: if the news simply didn't support the requested length, say so rather
+  // than padding. The app should show actual duration, not the requested one.
+  manifest.requested_sec = budgetSec;
+  manifest.actual_sec = total;
+  if (total < budgetSec * 0.8) manifest.note = 'Today\'s news ran short — this is everything that happened.';
   await pool.query(
     `INSERT INTO daily_briefs (user_id, cycle_date, manifest, total_sec) VALUES ($1,$2,$3,$4)
      ON CONFLICT (user_id, cycle_date) DO UPDATE SET manifest=$3, total_sec=$4`,
@@ -819,6 +828,13 @@ app.put('/api/brief/config', requireUser(async (req, res) => {
     return res.status(403).json({ error: 'length_locked', requiredTier: 'paid', maxLengthMin: maxLenFor(u) });
   if (!isPaid(u) && topic_ids.length > FREE_MAX_CATEGORIES)
     return res.status(403).json({ error: 'category_limit', requiredTier: 'paid', max: FREE_MAX_CATEGORIES });
+  // A brief is a BRIEF: long briefs need at least 2 topics. One topic cannot honestly
+  // fill 20 minutes daily without padding, and padding is what makes AI content worthless.
+  if (len > LONG_BRIEF_MIN && topic_ids.length < MIN_TOPICS_FOR_LONG)
+    return res.status(400).json({
+      error: 'need_more_topics', minTopics: MIN_TOPICS_FOR_LONG, forLengthOver: LONG_BRIEF_MIN,
+      message: 'Briefs longer than ' + LONG_BRIEF_MIN + ' minutes need at least ' +
+               MIN_TOPICS_FOR_LONG + ' topics.' });
   if (!isPaid(u) && deliver_at)
     return res.status(403).json({ error: 'scheduling_locked', requiredTier: 'paid' });
 
