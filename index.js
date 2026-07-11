@@ -41,7 +41,7 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 
 const TTS_PROVIDER = process.env.TTS_PROVIDER || 'openai';
 const VOICES = { fable: 'fable', nova: 'nova', alloy: 'alloy', coral: 'coral' };
-const DEFAULT_VOICE = 'fable';
+const DEFAULT_VOICE = 'alloy';   // neutral American; Fable has a British lilt
 const TTS_MODEL = process.env.TTS_MODEL || 'tts-1';
 
 const MIN_STORIES  = Number(process.env.MIN_STORIES  || 8);
@@ -105,7 +105,7 @@ async function initDb() {
       user_id text PRIMARY KEY,
       topic_ids jsonb NOT NULL DEFAULT '[]',
       length_min int NOT NULL DEFAULT 5,
-      voice text NOT NULL DEFAULT 'fable',
+      voice text NOT NULL DEFAULT 'alloy',
       deliver_at text,
       timezone text DEFAULT 'America/New_York',
       updated_at timestamptz DEFAULT now()
@@ -574,7 +574,7 @@ function cycleDate() {
 }
 const SEGMENT_MIN = Number(process.env.SEGMENT_MIN || 4); // minutes per topic segment
 
-async function generateTopic(topic, date) {
+async function generateTopic(topic, date, activeVoices) {
   const t0 = Date.now();
   try {
     const { items, windowUsed, thin } = await retrieveRobust(topic);
@@ -596,7 +596,7 @@ async function generateTopic(topic, date) {
     const dir = path.join(AUDIO_DIR, topic.id, date);
     fs.mkdirSync(dir, { recursive: true });
 
-    for (const voice of Object.keys(VOICES)) {
+    for (const voice of (activeVoices && activeVoices.length ? activeVoices : [DEFAULT_VOICE])) {
       const out = path.join(dir, voice + '.mp3');
       const { durationSec } = await synthesizeToFile(script, voice, out);
       await pool.query(
@@ -607,7 +607,8 @@ async function generateTopic(topic, date) {
         [topic.id, date, voice, '/audio/' + topic.id + '/' + date + '/' + voice + '.mp3',
          durationSec, script, JSON.stringify(sources), items.length, thin ? 'thin' : 'ok']);
     }
-    console.log('[OK] ' + topic.id + ' stories=' + items.length + ' window=' + windowUsed + 'h ' +
+    console.log('[OK] ' + topic.id + ' stories=' + items.length + ' window=' + windowUsed + 'h voices=' +
+                (activeVoices || [DEFAULT_VOICE]).join('/') + ' ' +
                 (thin ? 'THIN ' : '') + ((Date.now() - t0) / 1000).toFixed(1) + 's');
     return { topic: topic.id, status: thin ? 'thin' : 'ok', stories: items.length };
   } catch (e) {
@@ -621,7 +622,17 @@ async function runBatch() {
   const date = cycleDate();
   console.log('=== BATCH START ' + date + ' ===');
   const { rows: topics } = await pool.query('SELECT * FROM topics WHERE is_live = true');
-  const results = await Promise.all(topics.map(t => genLimit(() => generateTopic(t, date))));
+
+  // LAZY VOICES: only synthesize voices somebody actually uses. The default voice
+  // is always rendered so a brand-new user has something to play immediately.
+  // Cuts both cost and batch time ~4x when everyone is on the default.
+  const { rows: vrows } = await pool.query('SELECT DISTINCT voice FROM user_briefs');
+  const activeVoices = [...new Set([DEFAULT_VOICE, ...vrows.map(r => r.voice)])]
+    .filter(v => VOICES[v]);
+  console.log('active voices this cycle: ' + activeVoices.join(', ') +
+              ' (of ' + Object.keys(VOICES).length + ' offered)');
+
+  const results = await Promise.all(topics.map(t => genLimit(() => generateTopic(t, date, activeVoices))));
 
   // Assemble every user's brief from the fresh catalog
   const { rows: briefs } = await pool.query('SELECT * FROM user_briefs');
@@ -667,12 +678,23 @@ async function assembleBrief(brief, date) {
   const voice = brief.voice || DEFAULT_VOICE;
   const budgetSec = (brief.length_min || FREE_MAX_LEN) * 60;
 
-  const { rows: segs } = await pool.query(
-    `SELECT DISTINCT ON (topic_id) s.*, t.label
+  const q = `SELECT DISTINCT ON (topic_id) s.*, t.label
        FROM segments s JOIN topics t ON t.id = s.topic_id
       WHERE s.topic_id = ANY($1) AND s.voice = $2 AND s.status <> 'failed'
-      ORDER BY topic_id, cycle_date DESC`,
-    [topicIds, voice]);
+      ORDER BY topic_id, cycle_date DESC`;
+  let { rows: segs } = await pool.query(q, [topicIds, voice]);
+
+  // LAZY-VOICE FALLBACK: if they just switched to a voice the batch hasn't
+  // rendered yet, serve the default voice rather than an empty brief. Their
+  // chosen voice starts with tomorrow's batch.
+  let voiceUsed = voice;
+  if (!segs.length && voice !== DEFAULT_VOICE) {
+    ({ rows: segs } = await pool.query(q, [topicIds, DEFAULT_VOICE]));
+    if (segs.length) {
+      voiceUsed = DEFAULT_VOICE;
+      console.log('voice fallback for ' + brief.user_id + ': ' + voice + ' not rendered yet -> ' + DEFAULT_VOICE);
+    }
+  }
 
   const byId = {}; for (const s of segs) byId[s.topic_id] = s;
   const ordered = topicIds.map(id => byId[id]).filter(Boolean); // §4.6: skip missing, don't say "no news"
@@ -695,7 +717,9 @@ async function assembleBrief(brief, date) {
 
   const manifest = {
     date,
-    voice,
+    voice: voiceUsed,
+    voice_requested: voice,
+    voice_pending: voiceUsed !== voice ? 'Your new voice starts tomorrow morning.' : undefined,
     intro: 'Good morning. It\'s ' + new Date(date + 'T12:00:00Z').toLocaleDateString('en-US',
       { weekday: 'long', month: 'long', day: 'numeric' }) + '. Here\'s your brief.',
     items,
