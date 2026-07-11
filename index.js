@@ -102,10 +102,15 @@ async function initDb() {
     );
     CREATE TABLE IF NOT EXISTS users (
       id text PRIMARY KEY,
+      token text NOT NULL,
       tier text NOT NULL DEFAULT 'free',
       email text,
       created_at timestamptz DEFAULT now()
     );
+    -- Backfill for anyone created before tokens existed.
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS token text;
+    UPDATE users SET token = encode(gen_random_bytes(24),'hex') WHERE token IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_users_token ON users (token);
     CREATE TABLE IF NOT EXISTS user_briefs (
       user_id text PRIMARY KEY,
       topic_ids jsonb NOT NULL DEFAULT '[]',
@@ -153,19 +158,17 @@ async function seedCategories() {
 }
 
 /* ----------------------------------------------------------------- auth -- */
+// Auth = the SECRET token minted at /api/auth/register. The usr_ id is public
+// (it's the RevenueCat app_user_id); the token is what proves you own the account.
+// Never authenticate on the id alone — it would be trivially guessable.
 async function getReqUser(req) {
-  const auth = req.headers.authorization || '';
-  const id = auth.replace(/^Bearer\s+/i, '').trim();
-  if (!id || !/^usr_[a-zA-Z0-9]+$/.test(id)) return null;
-  const { rows } = await pool.query('SELECT * FROM users WHERE id=$1', [id]);
-  if (rows[0]) {
-    if (DEVELOPER_IDS.includes(id)) rows[0].tier = 'paid'; // dev bypass
-    return rows[0];
-  }
-  const tier = DEVELOPER_IDS.includes(id) ? 'paid' : 'free';
-  const { rows: n } = await pool.query(
-    'INSERT INTO users (id, tier) VALUES ($1,$2) ON CONFLICT (id) DO NOTHING RETURNING *', [id, tier]);
-  return n[0] || { id, tier };
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  if (!bearer) return null;
+  const { rows } = await pool.query('SELECT * FROM users WHERE token=$1', [bearer]);
+  if (!rows[0]) return null;
+  const u = rows[0];
+  if (DEVELOPER_IDS.includes(u.id)) u.tier = 'paid'; // dev bypass
+  return u;
 }
 function requireUser(fn) {
   return async (req, res) => {
@@ -791,6 +794,17 @@ app.get('/api/health', async (_req, res) => {
 });
 
 // The pickable menu — categories + the guided-picker taxonomy (no blank box).
+// Mint a new anonymous account. The app calls this ONCE on first launch and
+// stores { userId, token } in the keychain. `userId` goes to RevenueCat as the
+// app_user_id; `token` is the Bearer for every subsequent request.
+app.post('/api/auth/register', async (_req, res) => {
+  const userId = 'usr_' + crypto.randomBytes(6).toString('hex');
+  const token = crypto.randomBytes(24).toString('hex');
+  const tier = DEVELOPER_IDS.includes(userId) ? 'paid' : 'free';
+  await pool.query('INSERT INTO users (id, token, tier) VALUES ($1,$2,$3)', [userId, token, tier]);
+  res.json({ userId, token, tier });
+});
+
 app.get('/api/catalog', async (_req, res) => {
   const { rows } = await pool.query(
     `SELECT id, label, kind, window_hours FROM topics WHERE kind='category' AND is_live=true ORDER BY label`);
@@ -805,6 +819,7 @@ app.get('/api/catalog', async (_req, res) => {
 app.get('/api/me', requireUser(async (req, res) => {
   const { rows } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [req.user.id]);
   res.json({
+    userId: req.user.id,     // pass this to Purchases.logIn() BEFORE any purchase
     id: req.user.id,
     tier: req.user.tier,
     limits: {
