@@ -102,14 +102,12 @@ async function initDb() {
     );
     CREATE TABLE IF NOT EXISTS users (
       id text PRIMARY KEY,
-      token text NOT NULL,
+      token text,
       tier text NOT NULL DEFAULT 'free',
       email text,
       created_at timestamptz DEFAULT now()
     );
-    -- Backfill for anyone created before tokens existed.
     ALTER TABLE users ADD COLUMN IF NOT EXISTS token text;
-    UPDATE users SET token = encode(gen_random_bytes(24),'hex') WHERE token IS NULL;
     CREATE INDEX IF NOT EXISTS idx_users_token ON users (token);
     CREATE TABLE IF NOT EXISTS user_briefs (
       user_id text PRIMARY KEY,
@@ -135,6 +133,15 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_seg_topic_date ON segments (topic_id, cycle_date DESC);
     CREATE INDEX IF NOT EXISTS idx_topics_live ON topics (is_live);
   `);
+  // Backfill tokens for any pre-token users, in JS so we don't depend on the
+  // pgcrypto extension being enabled (gen_random_bytes would crash boot).
+  const { rows: legacy } = await pool.query('SELECT id FROM users WHERE token IS NULL');
+  for (const u of legacy) {
+    await pool.query('UPDATE users SET token=$2 WHERE id=$1',
+      [u.id, crypto.randomBytes(24).toString('hex')]);
+  }
+  if (legacy.length) console.log('backfilled tokens for ' + legacy.length + ' legacy user(s)');
+
   await seedCategories();
   console.log('db ready');
 }
@@ -788,9 +795,11 @@ async function resolveOrCreateTopic(rawLabel) {
    ENDPOINTS
    ========================================================================== */
 app.get('/api/health', async (_req, res) => {
-  let db = false;
-  try { await pool.query('SELECT 1'); db = true; } catch {}
-  res.json({ ok: true, version: VERSION, mock: MOCK_MODE, db, tts_provider: TTS_PROVIDER });
+  let db = false, dbErr = null;
+  try { await pool.query('SELECT 1'); db = true; } catch (e) { dbErr = e.message; }
+  res.json({ ok: !bootError && db, version: VERSION, mock: MOCK_MODE, db,
+             tts_provider: TTS_PROVIDER, bootError: bootError || undefined,
+             dbError: dbErr || undefined });
 });
 
 // The pickable menu — categories + the guided-picker taxonomy (no blank box).
@@ -1052,9 +1061,18 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 /* ---- boot --------------------------------------------------------------- */
+let bootError = null;
 initDb()
-  .then(() => app.listen(PORT, () => console.log('MyCast ' + VERSION + ' on port ' + PORT +
-    ' (tts=' + TTS_PROVIDER + '/' + TTS_MODEL + (MOCK_MODE ? ', MOCK' : '') + ')')))
-  .catch(e => { console.error('boot failed:', e); process.exit(1); });
+  .catch(e => {
+    // Do NOT exit. A dead process gives Railway's opaque "Application failed to
+    // respond" with no way to diagnose. Stay up and report the error on /api/health.
+    bootError = e.message;
+    console.error('DB INIT FAILED (server still starting so you can diagnose):', e);
+  })
+  .finally(() => {
+    app.listen(PORT, () => console.log('MyCast ' + VERSION + ' on port ' + PORT +
+      ' (tts=' + TTS_PROVIDER + '/' + TTS_MODEL + (MOCK_MODE ? ', MOCK' : '') +
+      (bootError ? ', DB_ERROR' : '') + ')'));
+  });
 
 module.exports = { app, runBatch, retrieveRobust, normalizeForTTS, assembleBrief, resolveOrCreateTopic, subscribeTopic, pool };
