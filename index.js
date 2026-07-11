@@ -40,7 +40,12 @@ const AUDIO_DIR = process.env.AUDIO_DIR || '/data/audio';
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 
 const TTS_PROVIDER = process.env.TTS_PROVIDER || 'openai';
-const VOICES = { fable: 'fable', nova: 'nova', alloy: 'alloy', coral: 'coral' };
+// OpenAI voices. onyx = deep male (news/narration), echo = neutral male,
+// alloy = androgynous, fable = British male, nova/coral/shimmer = female.
+const VOICES = {
+  onyx: 'onyx', echo: 'echo', alloy: 'alloy', fable: 'fable',
+  nova: 'nova', coral: 'coral', shimmer: 'shimmer',
+};
 const DEFAULT_VOICE = 'alloy';   // neutral American; Fable has a British lilt
 const TTS_MODEL = process.env.TTS_MODEL || 'tts-1';
 
@@ -964,6 +969,31 @@ app.get('/api/admin/topics', requireAdmin(async (_req, res) => {
   const { rows } = await pool.query(
     'SELECT id, kind, label, norm_key, window_hours, subscriber_count, is_live FROM topics ORDER BY kind, label');
   res.json({ count: rows.length, topics: rows });
+}));
+
+// Audition a voice on a REAL segment without running a full batch.
+// GET /api/admin/voice-sample?topic=world_news&voice=onyx
+app.get('/api/admin/voice-sample', requireAdmin(async (req, res) => {
+  const topicId = req.query.topic || 'world_news';
+  const voice = req.query.voice || DEFAULT_VOICE;
+  if (!VOICES[voice]) return res.status(400).json({ error: 'bad_voice', available: Object.keys(VOICES) });
+  const { rows } = await pool.query(
+    `SELECT script, cycle_date FROM segments WHERE topic_id=$1 AND status<>'failed'
+     ORDER BY cycle_date DESC LIMIT 1`, [topicId]);
+  if (!rows[0]) return res.status(404).json({ error: 'no_segment_for_topic', topic: topicId });
+  const date = new Date(rows[0].cycle_date).toISOString().slice(0, 10);
+  const dir = path.join(AUDIO_DIR, topicId, date);
+  fs.mkdirSync(dir, { recursive: true });
+  const out = path.join(dir, voice + '.mp3');
+  const { durationSec } = await synthesizeToFile(rows[0].script, voice, out);
+  const url = '/audio/' + topicId + '/' + date + '/' + voice + '.mp3';
+  await pool.query(
+    `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, duration_sec, script, sources, story_count, status)
+     SELECT topic_id, cycle_date, $3, $4, $5, script, sources, story_count, status
+       FROM segments WHERE topic_id=$1 AND cycle_date=$2 LIMIT 1
+     ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET audio_path=$4, duration_sec=$5`,
+    [topicId, date, voice, url, durationSec]);
+  res.json({ ok: true, topic: topicId, voice, durationSec, url: absolute(url) });
 }));
 
 app.get('/api/diag/tts', requireAdmin(async (_req, res) => {
