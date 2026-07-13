@@ -1032,6 +1032,44 @@ app.get('/api/admin/topics', requireAdmin(async (_req, res) => {
 
 // Audition a voice on a REAL segment without running a full batch.
 // GET /api/admin/voice-sample?topic=world_news&voice=onyx
+// TEMP DIAGNOSTIC — open in a browser to see exactly what's wrong for one user.
+// Usage: /api/admin/diag/user?token=ADMINTOKEN&user=usr_b4ce3c8a68d8
+app.get('/api/admin/diag/user', async (req, res) => {
+  const t = String(req.query.token || '');
+  if (!ADMIN_TOKEN || t !== ADMIN_TOKEN) return res.status(403).json({ error: 'forbidden' });
+  const userId = String(req.query.user || '');
+  if (!userId) return res.status(400).json({ error: 'user required' });
+  const result = { userId };
+  try {
+    const u = await pool.query('SELECT id,tier,created_at FROM users WHERE id=$1', [userId]);
+    result.user = u.rows[0] || null;
+    const b = await pool.query('SELECT user_id,voice,length_min,topic_ids,timezone,deliver_at,updated_at FROM user_briefs WHERE user_id=$1', [userId]);
+    result.brief = b.rows[0] || null;
+    if (b.rows[0]) {
+      const tids = b.rows[0].topic_ids || [];
+      result.topic_count = tids.length;
+      const seg = await pool.query(
+        `SELECT topic_id, voice, cycle_date::text as cycle_date, duration_sec, status
+           FROM segments
+          WHERE topic_id = ANY($1) AND status='ok'
+          ORDER BY topic_id, cycle_date DESC`, [tids]);
+      const perTopic = {};
+      for (const s of seg.rows) {
+        if (!perTopic[s.topic_id]) perTopic[s.topic_id] = [];
+        if (perTopic[s.topic_id].length < 3) perTopic[s.topic_id].push({voice:s.voice,cycle_date:s.cycle_date,duration_sec:s.duration_sec});
+      }
+      result.segments_per_topic = perTopic;
+      result.topics_with_no_segments = tids.filter(id => !perTopic[id]);
+      // simulate what assembleBrief would return right now
+      try {
+        const m = await assembleBrief(b.rows[0], cycleDate());
+        result.assembled = m ? { items: m.items.length, actual_sec: m.actual_sec, requested_sec: m.requested_sec, voice: m.voice, note: m.note } : null;
+      } catch (e) { result.assembled_error = e.message; }
+    }
+  } catch (e) { result.error = e.message; }
+  res.json(result);
+});
+
 app.get('/api/admin/voice-sample', requireAdmin(async (req, res) => {
   const topicId = req.query.topic || 'world_news';
   const voice = req.query.voice || DEFAULT_VOICE;
