@@ -694,33 +694,39 @@ async function retireDeadTopics() {
 async function assembleBrief(brief, date) {
   const topicIds = brief.topic_ids || [];
   if (!topicIds.length) return null;
-  const voice = brief.voice || DEFAULT_VOICE;
+  const requestedVoice = brief.voice || DEFAULT_VOICE;
   const budgetSec = (brief.length_min || FREE_MAX_LEN) * 60;
 
-  const q = `SELECT DISTINCT ON (topic_id) s.*, t.label
-       FROM segments s JOIN topics t ON t.id = s.topic_id
-      WHERE s.topic_id = ANY($1) AND s.voice = $2 AND s.status <> 'failed'
-      ORDER BY topic_id, cycle_date DESC`;
-  let { rows: segs } = await pool.query(q, [topicIds, voice]);
+  // PER-SEGMENT VOICE FALLBACK. Pull the latest OK segment for each topic in
+  // ANY available voice, preferring the user's requested voice, then the
+  // default, then anything else. This is the fix for the "4 of 17 topics"
+  // bug: when a user switches voices between batches, most of their topics
+  // still only have segments in the old voice — we serve those rather than
+  // silently drop the topic.
+  const q = `SELECT DISTINCT ON (topic_id) topic_id, voice, cycle_date, audio_path,
+                    duration_sec, sources, story_count, status,
+                    (SELECT label FROM topics t WHERE t.id = segments.topic_id) AS label
+               FROM segments
+              WHERE topic_id = ANY($1) AND status = 'ok'
+              ORDER BY topic_id,
+                       CASE WHEN voice = $2 THEN 0
+                            WHEN voice = $3 THEN 1
+                            ELSE 2 END,
+                       cycle_date DESC`;
+  const { rows: segs } = await pool.query(q, [topicIds, requestedVoice, DEFAULT_VOICE]);
 
-  // LAZY-VOICE FALLBACK: if they just switched to a voice the batch hasn't
-  // rendered yet, serve the default voice rather than an empty brief. Their
-  // chosen voice starts with tomorrow's batch.
-  let voiceUsed = voice;
-  if (!segs.length && voice !== DEFAULT_VOICE) {
-    ({ rows: segs } = await pool.query(q, [topicIds, DEFAULT_VOICE]));
-    if (segs.length) {
-      voiceUsed = DEFAULT_VOICE;
-      console.log('voice fallback for ' + brief.user_id + ': ' + voice + ' not rendered yet -> ' + DEFAULT_VOICE);
-    }
-  }
-
-  const byId = {}; for (const s of segs) byId[s.topic_id] = s;
-  const ordered = topicIds.map(id => byId[id]).filter(Boolean); // §4.6: skip missing, don't say "no news"
+  const byId = {};
+  for (const s of segs) byId[s.topic_id] = s;
+  const ordered = topicIds.map(id => byId[id]).filter(Boolean);
   if (!ordered.length) return null;
 
-  // Proportional trim to the user's budget. Segments are inverted-pyramid, so a
-  // trim from the end stays coherent.
+  // What voice(s) did we actually serve? Report honestly.
+  const voicesServed = [...new Set(ordered.map(s => s.voice))];
+  const primaryVoice = ordered[0].voice;
+  const anyFallback = ordered.some(s => s.voice !== requestedVoice);
+
+  // Proportional trim to the user's budget. Segments are inverted-pyramid, so
+  // a trim from the end stays coherent.
   const totalSec = ordered.reduce((a, s) => a + (s.duration_sec || 0), 0);
   const scale = totalSec > budgetSec ? budgetSec / totalSec : 1;
 
@@ -729,26 +735,43 @@ async function assembleBrief(brief, date) {
     label: s.label,
     url: absolute(s.audio_path),
     duration_sec: s.duration_sec,
-    play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)), // trim point
+    play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)),
     sources: s.sources || [],
+    voice: s.voice, // per-segment voice so the client can show mixed-voice state if needed
     status: s.status,
   }));
 
+  // Correct-timezone intro. UTC-noon-parsing was rendering the wrong weekday
+  // near midnight boundaries. Anchor to the user's TZ if we have it.
+  const tz = brief.timezone || 'America/New_York';
+  const introDate = new Date(date + 'T12:00:00');
+  const weekday = introDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: tz });
+
+  const total = items.reduce((a, i) => a + i.play_sec, 0);
+  const missingTopics = topicIds.length - items.length;
+
   const manifest = {
     date,
-    voice: voiceUsed,
-    voice_requested: voice,
-    voice_pending: voiceUsed !== voice ? 'Your new voice starts tomorrow morning.' : undefined,
-    intro: 'Good morning. It\'s ' + new Date(date + 'T12:00:00Z').toLocaleDateString('en-US',
-      { weekday: 'long', month: 'long', day: 'numeric' }) + '. Here\'s your brief.',
+    voice: primaryVoice,
+    voice_requested: requestedVoice,
+    voice_pending: anyFallback ? 'Some segments are still in your previous voice — your new voice will be fully in place after tomorrow morning\'s update.' : undefined,
+    voices_used: voicesServed,
+    intro: 'Good morning. It\'s ' + weekday + '. Here\'s your Cast.',
     items,
+    requested_topic_count: topicIds.length,
+    included_topic_count: items.length,
+    missing_topic_count: missingTopics,
+    requested_sec: budgetSec,
+    actual_sec: total,
   };
-  const total = items.reduce((a, i) => a + i.play_sec, 0);
-  // Honesty: if the news simply didn't support the requested length, say so rather
-  // than padding. The app should show actual duration, not the requested one.
-  manifest.requested_sec = budgetSec;
-  manifest.actual_sec = total;
-  if (total < budgetSec * 0.8) manifest.note = 'Today\'s news ran short — this is everything that happened.';
+  // Only say "news ran short" if we genuinely have all the topics and the
+  // aggregate audio is under-budget. Otherwise it's a voice/segment gap, not
+  // a news gap — the client should message that differently.
+  if (missingTopics === 0 && total < budgetSec * 0.8) {
+    manifest.note = 'Today\'s news ran short — this is everything that happened.';
+  } else if (missingTopics > 0) {
+    manifest.note = missingTopics + ' of your topics don\'t have audio yet — they\'ll be in tomorrow\'s Cast.';
+  }
   await pool.query(
     `INSERT INTO daily_briefs (user_id, cycle_date, manifest, total_sec) VALUES ($1,$2,$3,$4)
      ON CONFLICT (user_id, cycle_date) DO UPDATE SET manifest=$3, total_sec=$4`,
