@@ -123,13 +123,9 @@ async function initDb() {
       topic_id text NOT NULL,
       PRIMARY KEY (user_id, topic_id)
     );
-    CREATE TABLE IF NOT EXISTS daily_briefs (
-      user_id text NOT NULL,
-      cycle_date date NOT NULL,
-      manifest jsonb NOT NULL,
-      total_sec int NOT NULL DEFAULT 0,
-      PRIMARY KEY (user_id, cycle_date)
-    );
+    -- daily_briefs table removed: GET always live-assembles now. Drop any
+    -- legacy rows so a stale cached manifest can't be served.
+    DROP TABLE IF EXISTS daily_briefs;
     CREATE INDEX IF NOT EXISTS idx_seg_topic_date ON segments (topic_id, cycle_date DESC);
     CREATE INDEX IF NOT EXISTS idx_topics_live ON topics (is_live);
   `);
@@ -653,9 +649,10 @@ async function runBatch() {
 
   const results = await Promise.all(topics.map(t => genLimit(() => generateTopic(t, date, activeVoices))));
 
-  // Assemble every user's brief from the fresh catalog
-  const { rows: briefs } = await pool.query('SELECT * FROM user_briefs');
-  for (const b of briefs) { try { await assembleBrief(b, date); } catch (e) { console.error('assemble ' + b.user_id, e.message); } }
+  // No pre-assembly. GET /api/brief/today live-assembles per request. Kept only
+  // for a health signal — count how many users are affected by this cycle.
+  const { rows: briefs } = await pool.query('SELECT COUNT(*)::int AS n FROM user_briefs');
+  const userCount = briefs[0] ? briefs[0].n : 0;
 
   await pruneOldSegments();
   await retireDeadTopics();
@@ -664,7 +661,7 @@ async function runBatch() {
   const thin = results.filter(r => r.status === 'thin').length;
   const failed = results.filter(r => r.status === 'failed').length;
   console.log('=== BATCH DONE — ok=' + ok + ' thin=' + thin + ' failed=' + failed +
-              ' users=' + briefs.length + ' ===');
+              ' users=' + userCount + ' ===');
   if (thin || failed) console.warn('ATTENTION: ' + (thin + failed) + ' topic(s) need source work');
   return { date, ok, thin, failed, results };
 }
@@ -772,10 +769,7 @@ async function assembleBrief(brief, date) {
   } else if (missingTopics > 0) {
     manifest.note = missingTopics + ' of your topics don\'t have audio yet — they\'ll be in tomorrow\'s Cast.';
   }
-  await pool.query(
-    `INSERT INTO daily_briefs (user_id, cycle_date, manifest, total_sec) VALUES ($1,$2,$3,$4)
-     ON CONFLICT (user_id, cycle_date) DO UPDATE SET manifest=$3, total_sec=$4`,
-    [brief.user_id, date, JSON.stringify(manifest), total]);
+  // (no longer persisted — GET always live-assembles)
   return manifest;
 }
 
@@ -953,15 +947,17 @@ app.delete('/api/brief/custom-topic/:id', requireUser(async (req, res) => {
 
 // Today's brief: the manifest of shared segments + source links.
 app.get('/api/brief/today', requireUser(async (req, res) => {
+  // ALWAYS LIVE-ASSEMBLE. No cache. A stale daily_briefs row was previously
+  // being served in place of a freshly-configured Cast; assembly is cheap
+  // (~50ms, DB-only, no generation), so there's no reason to cache.
   const date = cycleDate();
-  const { rows } = await pool.query(
-    'SELECT * FROM daily_briefs WHERE user_id=$1 ORDER BY cycle_date DESC LIMIT 1', [req.user.id]);
-  if (rows[0]) return res.json({ ok: true, ...rows[0].manifest, total_sec: rows[0].total_sec, stale: rows[0].cycle_date.toISOString().slice(0,10) !== date });
-
   const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [req.user.id]);
-  if (!b[0]) return res.status(404).json({ error: 'no_brief_configured' });
+  if (!b[0] || !(b[0].topic_ids || []).length) return res.status(404).json({ error: 'no_brief_configured' });
   const manifest = await assembleBrief(b[0], date);
-  if (!manifest) return res.status(503).json({ error: 'catalog_not_ready' });
+  if (!manifest || !manifest.items || !manifest.items.length) {
+    return res.status(503).json({ error: 'catalog_not_ready',
+      message: 'Your Cast is being prepared — check back in a moment.' });
+  }
   res.json({ ok: true, ...manifest });
 }));
 
