@@ -479,23 +479,42 @@ function sourcesBlock(sources) {
 async function writeSegmentScript(topic, sources, targetMin) {
   const targetWords = Math.round(targetMin * 160);
   const prompt =
-    'PERSONA: You are "The Wire Editor" — a senior news editor with 20 years in broadcast journalism. ' +
-    'You write the way the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
-    'Write ONE spoken-audio news segment of about ' + targetWords + ' words on: ' + topic.label + '\n\n' +
-    'HOW TO REPORT (this is the whole job):\n' +
-    '- INVERTED PYRAMID: lead with the single most important, most RECENT concrete development, then supporting detail in descending importance. The listener must get the headline even if they only hear the first sentence. (A trim to half-length must still be coherent.)\n' +
-    '- SYNTHESIZE ACROSS SOURCES: never summarize any single article. Combine facts from multiple outlets into one original account.\n' +
-    '- REPORT THE FACTS, not another outlet\'s expression of them. Do NOT track the structure, order, framing, angle, or wording of any one source.\n' +
-    '- NAMED ATTRIBUTION MID-STORY: weave the source into the sentence — "Reuters reports the central bank raised rates" — not a citation tacked on at the end.\n' +
-    '- NEVER fabricate attribution: only credit an outlet for facts that genuinely come from ITS item below.\n' +
+    'You are writing a single news segment that will be stitched together with other segments to form one continuous audio brief. ' +
+    'A separate intro line ("Here\'s your Cast, [day]") is played before all segments, and short transitions are played between them. ' +
+    'Your segment is one piece of a whole — write it as MID-SHOW copy, never as a standalone piece.\n\n' +
+
+    'TOPIC: ' + topic.label + '\n' +
+    'TARGET LENGTH: about ' + targetWords + ' words (this is a CEILING — write less if there is less news).\n\n' +
+
+    'ABSOLUTE RULES — VIOLATING ANY OF THESE MAKES THE SEGMENT UNUSABLE:\n' +
+    '1. DO NOT open with a greeting. FORBIDDEN opening words/phrases include: "Good morning", "Good afternoon", "Good evening", "Hello", "Hi", "Welcome", "Welcome back", "Thanks for listening", "Today\'s Cast", "In today\'s", "Here\'s what\'s happening", "Top stories", "Coming up", "Let\'s start with", "Let\'s begin".\n' +
+    '2. DO NOT mention the date, day of the week, current time, or any temporal frame like "this morning", "tonight", "today", "this week". If timing matters to a story, use specifics like "Tuesday\'s Fed meeting" — never a generic time reference.\n' +
+    '3. DO NOT include a closing line. No "that\'s the news on X", no "more on that later", no "back after this". End on the last fact.\n' +
+    '4. DO NOT reference other topics or segments. Do not say "in other news", "turning to", "speaking of". This segment does not know what comes before or after it.\n' +
+    '5. DO NOT address the listener directly (no "you", no "we\'ll", no "stay tuned").\n\n' +
+
+    'WRONG OPENING (do not do this):\n' +
+    '  "Good morning. Today in markets, the S&P closed higher..."\n' +
+    '  "Welcome back. Here\'s the latest on the Fed..."\n' +
+    'RIGHT OPENING (do this):\n' +
+    '  "The S&P closed at 5,832, up 1.4 percent on the day, after the Fed held rates steady..."\n' +
+    '  "Federal prosecutors filed new charges against..."\n\n' +
+
+    'HOW TO REPORT:\n' +
+    '- START WITH A FACT. First sentence names a subject and states a concrete development. No framing, no throat-clearing.\n' +
+    '- INVERTED PYRAMID: the most important development first, supporting detail in descending order. A trim to half-length must still make sense.\n' +
+    '- SYNTHESIZE ACROSS SOURCES: never summarize a single article. Combine facts from multiple outlets into one original account.\n' +
+    '- REPORT THE FACTS, not another outlet\'s expression of them. Do not mirror the structure, framing, or wording of any single source.\n' +
+    '- NAMED ATTRIBUTION MID-STORY: "Reuters reports the central bank raised rates" — not a citation tacked on.\n' +
+    '- NEVER fabricate attribution: only credit an outlet for facts that genuinely came from its item below.\n' +
     '- If a striking exact quote is essential, keep it UNDER 10 WORDS and attribute it.\n' +
-    '- WRITE FOR THE EAR: short sentences, active voice, no headers, no bullet points, no markdown. Spell nothing out that a narrator would not say aloud.\n' +
-    '- LENGTH IS A CEILING, NOT A QUOTA. If there is genuinely less news, write LESS. Never pad, never repeat, never speculate to fill time.\n' +
-    '- DO NOT open with a greeting (no "good morning", no "hello", no "today\'s Cast"). DO NOT state the current date or day of week — the app handles the intro. Start directly with the news.\n' +
-    '- If the source material genuinely contains no real development, say so in one short sentence and stop.\n\n' +
-    'SOURCE MATERIAL (published within the last ' + (topic.window_hours || 24) + ' hours where available; ' +
-    'items are ranked, freshest and highest-quality first):\n' + sourcesBlock(sources) + '\n\n' +
-    'Output ONLY the spoken script text. No preamble, no title, no notes.';
+    '- WRITE FOR THE EAR: short sentences, active voice, no headers or bullets or markdown.\n' +
+    '- NEVER PAD. If the news genuinely runs short, write less. Do not repeat, do not speculate.\n\n' +
+
+    'SOURCE MATERIAL (freshest and highest-quality first, published within the last ' + (topic.window_hours || 24) + ' hours where available):\n' +
+    sourcesBlock(sources) + '\n\n' +
+
+    'Output ONLY the spoken script text. No preamble, no title, no notes, no metadata. Start with the first news sentence.';
   return callClaude(prompt, Math.max(1200, targetWords * 3), { timeoutMs: 120000, tries: 2 });
 }
 
@@ -689,6 +708,28 @@ async function retireDeadTopics() {
 /* =============================================================================
    ASSEMBLY — a brief is a MANIFEST of shared segments. Cost to serve ~= $0.
    ========================================================================== */
+// Short spoken transition between topics. Synthesized once per (topic, voice, date).
+// Cached in AUDIO_DIR so we only synthesize once. Kept intentionally short and
+// consistent so the whole brief feels like a produced show rather than jump-cuts
+// between independent scripts.
+async function ensureTransitionAudio(label, voice, date) {
+  const slug = String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const dir = path.join(AUDIO_DIR, '_transitions', date);
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = slug + '__' + voice + '.mp3';
+  const outPath = path.join(dir, filename);
+  const urlPath = '/audio/_transitions/' + date + '/' + filename;
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 500) return urlPath;
+  const text = 'Next up: ' + label + '.';
+  try {
+    await synthesizeToFile(text, voice, outPath);
+    return urlPath;
+  } catch (e) {
+    console.error('transition synth failed:', e.message);
+    return null;
+  }
+}
+
 // Personalized intro audio, generated on demand per (user, voice, date).
 // Cached in AUDIO_DIR so we only synthesize once per day per user per voice.
 async function ensureIntroAudio(user, voice, date, tz) {
@@ -754,16 +795,24 @@ async function assembleBrief(brief, date) {
   const totalSec = ordered.reduce((a, s) => a + (s.duration_sec || 0), 0);
   const scale = totalSec > budgetSec ? budgetSec / totalSec : 1;
 
-  const items = ordered.map(s => ({
-    topic_id: s.topic_id,
-    label: s.label,
-    url: absolute(s.audio_path),
-    duration_sec: s.duration_sec,
-    play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)),
-    sources: s.sources || [],
-    voice: s.voice, // per-segment voice so the client can show mixed-voice state if needed
-    status: s.status,
-  }));
+  const items = [];
+  for (let i = 0; i < ordered.length; i++) {
+    const s = ordered[i];
+    // Every item after the first gets a short bridge line before its segment.
+    let transitionUrl = null;
+    if (i > 0) transitionUrl = await ensureTransitionAudio(s.label, s.voice, date);
+    items.push({
+      topic_id: s.topic_id,
+      label: s.label,
+      transition_url: transitionUrl ? absolute(transitionUrl) : undefined,
+      url: absolute(s.audio_path),
+      duration_sec: s.duration_sec,
+      play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)),
+      sources: s.sources || [],
+      voice: s.voice,
+      status: s.status,
+    });
+  }
 
   // Correct-timezone intro. UTC-noon-parsing was rendering the wrong weekday
   // near midnight boundaries. Anchor to the user's TZ if we have it.
@@ -1040,6 +1089,33 @@ app.post('/api/billing/refresh', requireUser(async (req, res) => {
 }));
 
 /* ---- admin -------------------------------------------------------------- */
+// Wipe today's catalog and regenerate everything fresh under the current prompt.
+// Useful when the prompt or seed has changed and you don't want to wait for 3am.
+app.post('/api/admin/batch/wipe-and-run', requireAdmin(async (_req, res) => {
+  res.json({ ok: true, wiping: true });
+  (async () => {
+    try {
+      const date = cycleDate();
+      console.log('=== WIPE + REBUILD initiated for ' + date + ' ===');
+      // Delete rendered audio for today so it can't be served stale.
+      await pool.query('DELETE FROM segments WHERE cycle_date=$1', [date]);
+      // Also flush intros and transitions so they get regenerated fresh.
+      const introsDir = path.join(AUDIO_DIR, '_intros', date);
+      const transitionsDir = path.join(AUDIO_DIR, '_transitions', date);
+      if (fs.existsSync(introsDir)) fs.rmSync(introsDir, { recursive: true, force: true });
+      if (fs.existsSync(transitionsDir)) fs.rmSync(transitionsDir, { recursive: true, force: true });
+      // Delete on-disk audio for today.
+      for (const t of fs.readdirSync(AUDIO_DIR)) {
+        if (t === '_intros' || t === '_transitions') continue;
+        const p = path.join(AUDIO_DIR, t, date);
+        if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
+      }
+      console.log('wipe complete, running batch...');
+      await runBatch();
+    } catch (e) { console.error('wipe-and-run error:', e); }
+  })();
+}));
+
 app.post('/api/admin/batch/run', requireAdmin(async (_req, res) => {
   res.json({ ok: true, started: true });   // respond immediately; batch runs on
   runBatch().catch(e => console.error('batch error:', e));  // the server, not the request
