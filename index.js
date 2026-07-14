@@ -108,6 +108,7 @@ async function initDb() {
       created_at timestamptz DEFAULT now()
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS token text;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS name text;
     CREATE INDEX IF NOT EXISTS idx_users_token ON users (token);
     CREATE TABLE IF NOT EXISTS user_briefs (
       user_id text PRIMARY KEY,
@@ -480,7 +481,6 @@ async function writeSegmentScript(topic, sources, targetMin) {
   const prompt =
     'PERSONA: You are "The Wire Editor" — a senior news editor with 20 years in broadcast journalism. ' +
     'You write the way the best wire services and morning shows do: fast, factual, never editorializing, always sourced. ' +
-    currentDateContext() + '\n\n' +
     'Write ONE spoken-audio news segment of about ' + targetWords + ' words on: ' + topic.label + '\n\n' +
     'HOW TO REPORT (this is the whole job):\n' +
     '- INVERTED PYRAMID: lead with the single most important, most RECENT concrete development, then supporting detail in descending importance. The listener must get the headline even if they only hear the first sentence. (A trim to half-length must still be coherent.)\n' +
@@ -491,6 +491,7 @@ async function writeSegmentScript(topic, sources, targetMin) {
     '- If a striking exact quote is essential, keep it UNDER 10 WORDS and attribute it.\n' +
     '- WRITE FOR THE EAR: short sentences, active voice, no headers, no bullet points, no markdown. Spell nothing out that a narrator would not say aloud.\n' +
     '- LENGTH IS A CEILING, NOT A QUOTA. If there is genuinely less news, write LESS. Never pad, never repeat, never speculate to fill time.\n' +
+    '- DO NOT open with a greeting (no "good morning", no "hello", no "today\'s Cast"). DO NOT state the current date or day of week — the app handles the intro. Start directly with the news.\n' +
     '- If the source material genuinely contains no real development, say so in one short sentence and stop.\n\n' +
     'SOURCE MATERIAL (published within the last ' + (topic.window_hours || 24) + ' hours where available; ' +
     'items are ranked, freshest and highest-quality first):\n' + sourcesBlock(sources) + '\n\n' +
@@ -688,6 +689,32 @@ async function retireDeadTopics() {
 /* =============================================================================
    ASSEMBLY — a brief is a MANIFEST of shared segments. Cost to serve ~= $0.
    ========================================================================== */
+// Personalized intro audio, generated on demand per (user, voice, date).
+// Cached in AUDIO_DIR so we only synthesize once per day per user per voice.
+async function ensureIntroAudio(user, voice, date, tz) {
+  const nameSlug = user && user.name ? user.name.trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '') : 'anon';
+  const dir = path.join(AUDIO_DIR, '_intros', date);
+  fs.mkdirSync(dir, { recursive: true });
+  const filename = nameSlug + '__' + voice + '.mp3';
+  const outPath = path.join(dir, filename);
+  const urlPath = '/audio/_intros/' + date + '/' + filename;
+  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 500) return urlPath;
+
+  const weekday = new Date(date + 'T12:00:00').toLocaleDateString('en-US',
+    { weekday: 'long', month: 'long', day: 'numeric', timeZone: tz || 'America/New_York' });
+  const firstName = user && user.name ? user.name.trim().split(/\s+/)[0] : null;
+  const text = firstName
+    ? 'Hey ' + firstName + ', here\'s your Cast. ' + weekday + '.'
+    : 'Here\'s your Cast. ' + weekday + '.';
+  try {
+    await synthesizeToFile(text, voice, outPath);
+    return urlPath;
+  } catch (e) {
+    console.error('intro synth failed:', e.message);
+    return null;
+  }
+}
+
 async function assembleBrief(brief, date) {
   const topicIds = brief.topic_ids || [];
   if (!topicIds.length) return null;
@@ -747,13 +774,22 @@ async function assembleBrief(brief, date) {
   const total = items.reduce((a, i) => a + i.play_sec, 0);
   const missingTopics = topicIds.length - items.length;
 
+  // Personalized intro audio — synthesized on demand, cached by (user, voice, date).
+  const { rows: urow } = await pool.query('SELECT name FROM users WHERE id=$1', [brief.user_id]);
+  const introUrl = await ensureIntroAudio(urow[0] || null, primaryVoice, date, tz);
+  const firstName = urow[0] && urow[0].name ? String(urow[0].name).trim().split(/\s+/)[0] : null;
+  const introText = firstName
+    ? 'Hey ' + firstName + ', here\'s your Cast. ' + weekday + '.'
+    : 'Here\'s your Cast. ' + weekday + '.';
+
   const manifest = {
     date,
     voice: primaryVoice,
     voice_requested: requestedVoice,
     voice_pending: anyFallback ? 'Some segments are still in your previous voice — your new voice will be fully in place after tomorrow morning\'s update.' : undefined,
     voices_used: voicesServed,
-    intro: 'Good morning. It\'s ' + weekday + '. Here\'s your Cast.',
+    intro: introText,
+    intro_url: introUrl ? absolute(introUrl) : undefined,
     items,
     requested_topic_count: topicIds.length,
     included_topic_count: items.length,
@@ -848,6 +884,7 @@ app.get('/api/me', requireUser(async (req, res) => {
     userId: req.user.id,     // pass this to Purchases.logIn() BEFORE any purchase
     id: req.user.id,
     tier: req.user.tier,
+    name: req.user.name || null,
     limits: {
       maxLengthMin: maxLenFor(req.user),
       maxCategories: isPaid(req.user) ? null : FREE_MAX_CATEGORIES,
@@ -860,7 +897,10 @@ app.get('/api/me', requireUser(async (req, res) => {
 // Set the brief: ordered topics, length, voice, delivery time.
 app.put('/api/brief/config', requireUser(async (req, res) => {
   const u = req.user;
-  const { topic_ids = [], length_min = FREE_MAX_LEN, voice = DEFAULT_VOICE, deliver_at = null, timezone } = req.body || {};
+  const { topic_ids = [], length_min = FREE_MAX_LEN, voice = DEFAULT_VOICE, deliver_at = null, timezone, name } = req.body || {};
+  if (typeof name === 'string' && name.trim().length && name.trim().length <= 40) {
+    await pool.query('UPDATE users SET name=$2 WHERE id=$1', [u.id, name.trim()]);
+  }
   if (!Array.isArray(topic_ids) || !topic_ids.length) return res.status(400).json({ error: 'topics_required' });
   if (!VOICES[voice]) return res.status(400).json({ error: 'bad_voice' });
 
