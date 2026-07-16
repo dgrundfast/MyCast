@@ -1,4 +1,3 @@
-root@ed4184769d20:/app# cat /app/index.js
 /* =============================================================================
    MYCAST — Backend v2.0
    =============================================================================
@@ -1254,4 +1253,3 @@ initDb()
   });
 
 module.exports = { app, runBatch, retrieveRobust, normalizeForTTS, assembleBrief, resolveOrCreateTopic, subscribeTopic, pool };
-root@ed4184769d20:/app# 
