@@ -1,3 +1,4 @@
+root@ed4184769d20:/app# cat /app/index.js
 /* =============================================================================
    MYCAST — Backend v2.0
    =============================================================================
@@ -592,8 +593,11 @@ async function synthesizeToFile(text, voice, outPath) {
   }
   const final = Buffer.concat(buffers);
   fs.writeFileSync(outPath, final);
-  // ~160 wpm spoken => words/2.67 = seconds
-  const durationSec = Math.round(spoken.split(/\s+/).filter(Boolean).length / 2.67);
+  // Byte-based duration: OpenAI tts-1 outputs ~32kbps MP3 = ~4000 bytes/sec.
+  // Word-count estimation drifted up to 36s on real files (Bug 1 fix).
+  const wordEstSec = Math.round(spoken.split(/\s+/).filter(Boolean).length / 2.67);
+  const byteEstSec = Math.round(final.length / 4000);
+  const durationSec = (byteEstSec > 5 && byteEstSec < wordEstSec * 2.5) ? byteEstSec : wordEstSec;
   return { bytes: final.length, durationSec };
 }
 
@@ -632,14 +636,15 @@ async function generateTopic(topic, date, activeVoices) {
     fs.mkdirSync(dir, { recursive: true });
 
     for (const voice of (activeVoices && activeVoices.length ? activeVoices : [DEFAULT_VOICE])) {
-      const out = path.join(dir, voice + '.mp3');
+      const scriptHash = crypto.createHash('sha1').update(script).digest('hex').slice(0, 6);
+      const out = path.join(dir, voice + '.' + scriptHash + '.mp3');
       const { durationSec } = await synthesizeToFile(script, voice, out);
       await pool.query(
         `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, duration_sec, script, sources, story_count, status)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
          ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET
            audio_path=$4, duration_sec=$5, script=$6, sources=$7, story_count=$8, status=$9`,
-        [topic.id, date, voice, '/audio/' + topic.id + '/' + date + '/' + voice + '.mp3',
+        [topic.id, date, voice, '/audio/' + topic.id + '/' + date + '/' + voice + '.' + scriptHash + '.mp3',
          durationSec, script, JSON.stringify(sources), items.length, thin ? 'thin' : 'ok']);
     }
     console.log('[OK] ' + topic.id + ' stories=' + items.length + ' window=' + windowUsed + 'h voices=' +
@@ -807,7 +812,7 @@ async function assembleBrief(brief, date) {
       transition_url: transitionUrl ? absolute(transitionUrl) : undefined,
       url: absolute(s.audio_path),
       duration_sec: s.duration_sec,
-      play_sec: Math.max(30, Math.floor((s.duration_sec || 0) * scale)),
+      play_sec: Math.min(Math.max(30, Math.floor((s.duration_sec || 0) * scale)), Math.max(30, (s.duration_sec || 0) - 2)),
       sources: s.sources || [],
       voice: s.voice,
       status: s.status,
@@ -1249,3 +1254,4 @@ initDb()
   });
 
 module.exports = { app, runBatch, retrieveRobust, normalizeForTTS, assembleBrief, resolveOrCreateTopic, subscribeTopic, pool };
+root@ed4184769d20:/app# 
