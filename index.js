@@ -716,22 +716,80 @@ async function retireDeadTopics() {
 // Cached in AUDIO_DIR so we only synthesize once. Kept intentionally short and
 // consistent so the whole brief feels like a produced show rather than jump-cuts
 // between independent scripts.
+//
+// BUG B FIX (July 2026): transitions were cached at STABLE filenames behind a
+// 500-byte guard. 500 bytes is ~0.125s of audio, so a truncated synth ("the
+// unintelligible blip" in Rork's report) passed validation and was then pinned
+// at that URL forever -- it could never self-heal on a later request.
+//
+// Two changes:
+//   1. Content-address the filename with a hash of (text + voice), matching the
+//      scheme already used for segments. New copy => new URL, so bytes at a
+//      published URL never change (Rork acceptance criterion #4).
+//   2. Validate against EXPECTED size rather than a flat floor, both on cache
+//      hit and immediately after synthesis, with one retry. Undersized output
+//      is treated as a failure instead of being cached.
+//
+const TTS_BYTES_PER_SEC = 4000;          // OpenAI tts-1 mp3 ~= 32kbps
+const TRANSITION_MIN_BYTES_ABS = 2500;   // hard floor (~0.6s) -- catches blips
+
+// Expected byte size of synthesized speech, from word count.
+function expectedTtsBytes(text) {
+  const words = String(text).split(/\s+/).filter(Boolean).length;
+  return Math.round((words / 2.67) * TTS_BYTES_PER_SEC);
+}
+
+// A file is acceptable if it clears the absolute floor AND is at least 60% of
+// the size we predicted for its script. The 60% band tolerates normal TTS
+// pacing variance while still rejecting genuine truncation.
+function ttsFileLooksComplete(filePath, text) {
+  if (!fs.existsSync(filePath)) return false;
+  const size = fs.statSync(filePath).size;
+  const need = Math.max(TRANSITION_MIN_BYTES_ABS, Math.round(expectedTtsBytes(text) * 0.6));
+  return size >= need;
+}
+
 async function ensureTransitionAudio(label, voice, date) {
   const slug = String(label).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  const text = 'Next up: ' + label + '.';
+
+  // Content-addressed: hash covers the spoken text and the voice, so any change
+  // to transition copy publishes a new URL instead of mutating an existing one.
+  const transHash = crypto.createHash('sha1').update(text + '|' + voice).digest('hex').slice(0, 6);
+
   const dir = path.join(AUDIO_DIR, '_transitions', date);
   fs.mkdirSync(dir, { recursive: true });
-  const filename = slug + '__' + voice + '.mp3';
+  const filename = slug + '__' + voice + '.' + transHash + '.mp3';
   const outPath = path.join(dir, filename);
   const urlPath = '/audio/_transitions/' + date + '/' + filename;
-  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 500) return urlPath;
-  const text = 'Next up: ' + label + '.';
-  try {
-    await synthesizeToFile(text, voice, outPath);
-    return urlPath;
-  } catch (e) {
-    console.error('transition synth failed:', e.message);
-    return null;
+
+  // Cache hit only counts if the cached bytes actually look complete.
+  if (ttsFileLooksComplete(outPath, text)) return urlPath;
+
+  // A file that exists but failed validation is a poisoned cache entry. Remove
+  // it so the retry below writes clean bytes.
+  if (fs.existsSync(outPath)) {
+    console.warn('transition cache REJECTED (undersized), regenerating:', filename,
+      fs.statSync(outPath).size + 'B');
+    try { fs.unlinkSync(outPath); } catch (_) {}
   }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await synthesizeToFile(text, voice, outPath);
+      if (ttsFileLooksComplete(outPath, text)) return urlPath;
+      console.warn('transition synth undersized (attempt ' + attempt + '):', filename,
+        (fs.existsSync(outPath) ? fs.statSync(outPath).size : 0) + 'B');
+      try { fs.unlinkSync(outPath); } catch (_) {}
+    } catch (e) {
+      console.error('transition synth failed (attempt ' + attempt + '):', e.message);
+    }
+  }
+
+  // Returning null makes assembleBrief emit no transition for this item, which
+  // plays as a clean segment-to-segment cut. Strictly better than a blip.
+  console.error('transition GAVE UP after 2 attempts:', filename);
+  return null;
 }
 
 // Personalized intro audio, generated on demand per (user, voice, date).
