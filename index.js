@@ -1088,10 +1088,16 @@ async function assembleBrief(brief, date) {
                     sources, story_count, status,
                     (SELECT label FROM topics t WHERE t.id = segments.topic_id) AS label
                FROM segments
-              WHERE topic_id = ANY($1) AND status = 'ok' AND audio_path <> ''
+              WHERE topic_id = ANY($1) AND status IN ('ok','thin') AND audio_path <> ''
               ORDER BY cycle_date DESC`;
   const { rows: segs } = await pool.query(q, [topicIds]);
 
+  // v2.1: 'thin' segments are SERVED, not dropped. v2.0 filtered status='ok',
+  // so a topic with genuinely light news vanished from the Cast entirely —
+  // worst on exactly the niche custom topics people pay for. Under the old
+  // trimming math a short segment collided with the 30s play_sec floor; now
+  // that every file plays whole, a thin segment simply plays short and ends on
+  // a sentence. 'failed' rows are still excluded (they carry no audio_path).
   const voiceRank = v => (v === requestedVoice ? 0 : v === DEFAULT_VOICE ? 1 : 2);
 
   // Pick one segment per topic. Voice match dominates (a consistent narrator
@@ -1148,6 +1154,7 @@ async function assembleBrief(brief, date) {
   const primaryVoice = ordered[0].voice;
   const anyFallback  = ordered.some(x => x.voice !== requestedVoice);
   const tierFallback = ordered.filter(x => x.tier !== depthOf(brief, x.topic_id));
+  const thinCount    = ordered.filter(x => x.status === 'thin').length;
 
   let overheadSec = 0;
   const items = [];
@@ -1210,6 +1217,7 @@ async function assembleBrief(brief, date) {
     budget_sec: budgetSec,
     entitled_sec: entitledSec,
     over_budget: overBudget || undefined,
+    thin_topic_count: thinCount || undefined,
     dropped_topics: dropped.length ? dropped : undefined,
     trial: { active: inTrial(owner), daysRemaining: trialDaysLeft(owner) },
   };
@@ -1557,7 +1565,7 @@ app.get('/api/admin/catalog/health', requireAdmin(async (_req, res) => {
             s.story_count, s.status, s.cycle_date, t.subscriber_count,
             (SELECT COUNT(DISTINCT s2.tier)::int FROM segments s2
               WHERE s2.topic_id = s.topic_id AND s2.cycle_date = s.cycle_date
-                AND s2.status = 'ok' AND s2.audio_path <> '') AS tiers_ready
+                AND s2.status IN ('ok','thin') AND s2.audio_path <> '') AS tiers_ready
        FROM segments s JOIN topics t ON t.id=s.topic_id
       ORDER BY s.topic_id, s.cycle_date DESC`);
   const thin = rows.filter(r => r.status !== 'ok');
@@ -1620,7 +1628,7 @@ app.get('/api/admin/diag/user', async (req, res) => {
       const seg = await pool.query(
         `SELECT topic_id, voice, tier, cycle_date::text as cycle_date, duration_sec, status
            FROM segments
-          WHERE topic_id = ANY($1) AND status='ok'
+          WHERE topic_id = ANY($1) AND status IN ('ok','thin') AND audio_path <> ''
           ORDER BY topic_id, cycle_date DESC`, [tids]);
       const perTopic = {};
       for (const s of seg.rows) {
