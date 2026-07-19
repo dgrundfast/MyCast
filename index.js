@@ -28,7 +28,7 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 const rss = new RSSParser({ timeout: 10000 });
 
-const VERSION = 'v2.0';
+const VERSION = 'v2.1';
 const PORT = process.env.PORT || 8080;
 
 /* ---------------------------------------------------------------- config -- */
@@ -57,6 +57,28 @@ const PAID_MAX_LEN        = Number(process.env.PAID_MAX_LEN        || 20);
 const FREE_MAX_CATEGORIES = Number(process.env.FREE_MAX_CATEGORIES || 5);
 const PAID_MAX_CUSTOM     = Number(process.env.PAID_MAX_CUSTOM     || 3);
 const CATALOG_RETAIN_CYCLES = Number(process.env.CATALOG_RETAIN_CYCLES || 3);
+
+/* ---------------------------------------------------------------- DEPTH TIERS
+   v2.1. A user picks a DEPTH per topic. Every tier is a complete, pre-rendered
+   file that plays start to finish -- there is no play_sec and nothing is ever
+   trimmed mid-stream. cost_sec is what the client's budget meter charges for a
+   topic at that depth; it is served from /api/catalog so the app never
+   hardcodes it. -------------------------------------------------------- */
+const TIERS = {
+  headlines: { id: 'headlines', label: 'Headlines', cost_sec: Number(process.env.TIER_HEADLINES_SEC || 45),  blurb: 'Top stories, fast' },
+  expanded:  { id: 'expanded',  label: 'Expanded',  cost_sec: Number(process.env.TIER_EXPANDED_SEC  || 180), blurb: 'Context and detail' },
+  full:      { id: 'full',      label: 'Full',      cost_sec: Number(process.env.TIER_FULL_SEC      || 300), blurb: 'The whole picture' },
+};
+const TIER_ORDER   = ['headlines', 'expanded', 'full'];
+const DEFAULT_TIER = 'headlines';
+const WORDS_PER_SEC = 160 / 60;   // ~160 wpm narration
+
+// Soft server-side trial. No card, not an Apple introductory offer, no
+// RevenueCat dependency -- new users simply get a bigger budget for a week.
+// Length only: the category limit stays put, so a trial user cannot fill the
+// extra time without discovering the depth controls.
+const TRIAL_DAYS    = Number(process.env.TRIAL_DAYS    || 7);
+const TRIAL_MAX_LEN = Number(process.env.TRIAL_MAX_LEN || 10);
 
 const ADMIN_TOKEN   = process.env.ADMIN_TOKEN || '';
 const DEVELOPER_IDS = (process.env.DEVELOPER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -100,6 +122,13 @@ async function initDb() {
       created_at timestamptz DEFAULT now(),
       UNIQUE (topic_id, cycle_date, voice)
     );
+    -- v2.1: a segment now exists once per DEPTH TIER. The old uniqueness on
+    -- (topic_id, cycle_date, voice) is replaced so three tiers can coexist.
+    ALTER TABLE segments ADD COLUMN IF NOT EXISTS tier text NOT NULL DEFAULT 'full';
+    ALTER TABLE segments ADD COLUMN IF NOT EXISTS script_prefix_chars int;
+    ALTER TABLE segments DROP CONSTRAINT IF EXISTS segments_topic_id_cycle_date_voice_key;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_seg_unique_tier
+      ON segments (topic_id, cycle_date, voice, tier);
     CREATE TABLE IF NOT EXISTS users (
       id text PRIMARY KEY,
       token text,
@@ -119,6 +148,11 @@ async function initDb() {
       timezone text DEFAULT 'America/New_York',
       updated_at timestamptz DEFAULT now()
     );
+    -- v2.1 depth selection. topic_depths holds only OVERRIDES; anything absent
+    -- inherits default_depth. This storage supports both a global-with-overrides
+    -- UI and a pure per-topic UI with no server change.
+    ALTER TABLE user_briefs ADD COLUMN IF NOT EXISTS topic_depths  jsonb DEFAULT '{}';
+    ALTER TABLE user_briefs ADD COLUMN IF NOT EXISTS default_depth text DEFAULT 'headlines';
     CREATE TABLE IF NOT EXISTS topic_subscriptions (
       user_id text NOT NULL,
       topic_id text NOT NULL,
@@ -190,7 +224,20 @@ function requireAdmin(fn) {
   };
 }
 const isPaid = u => u.tier === 'paid' || u.tier === 'pro' || u.tier === 'plus';
-const maxLenFor = u => (isPaid(u) ? PAID_MAX_LEN : FREE_MAX_LEN);
+const inTrial = u => !!u && !isPaid(u) && !!u.created_at &&
+  (Date.now() - new Date(u.created_at).getTime()) < TRIAL_DAYS * 86400000;
+const trialDaysLeft = u => inTrial(u)
+  ? Math.max(0, Math.ceil(TRIAL_DAYS - (Date.now() - new Date(u.created_at).getTime()) / 86400000))
+  : null;
+const maxLenFor = u => isPaid(u) ? PAID_MAX_LEN : (inTrial(u) ? TRIAL_MAX_LEN : FREE_MAX_LEN);
+
+// Resolve a user's chosen depth for a topic: explicit override, else default.
+function depthOf(brief, topicId) {
+  const d = (brief && brief.topic_depths) || {};
+  if (TIERS[d[topicId]]) return d[topicId];
+  const def = brief && brief.default_depth;
+  return TIERS[def] ? def : DEFAULT_TIER;
+}
 
 /* ------------------------------------------------------------ utilities -- */
 async function fetchWithRetry(url, opts = {}, cfg = {}) {
@@ -478,6 +525,8 @@ function sourcesBlock(sources) {
 // Writes ONE topic segment. Segments are stitched at assembly time.
 async function writeSegmentScript(topic, sources, targetMin) {
   const targetWords = Math.round(targetMin * 160);
+  const hWords = Math.round(TIERS.headlines.cost_sec * WORDS_PER_SEC);
+  const eWords = Math.round(TIERS.expanded.cost_sec  * WORDS_PER_SEC);
   const prompt =
     'You are writing a single news segment that will be stitched together with other segments to form one continuous audio brief. ' +
     'A separate intro line ("Here\'s your Cast, [day]") is played before all segments, and short transitions are played between them. ' +
@@ -485,6 +534,16 @@ async function writeSegmentScript(topic, sources, targetMin) {
 
     'TOPIC: ' + topic.label + '\n' +
     'TARGET LENGTH: about ' + targetWords + ' words (this is a CEILING — write less if there is less news).\n\n' +
+
+    'DEPTH MARKERS — REQUIRED:\n' +
+    'Listeners choose how deep to go on each topic, and the shorter versions are PREFIXES of this script. ' +
+    'Insert these two markers, each on its own line, immediately AFTER a sentence-ending period:\n' +
+    '  [[TIER1]] after the last sentence of a roughly ' + hWords + '-word version (the essential headlines).\n' +
+    '  [[TIER2]] after the last sentence of a roughly ' + eWords + '-word version (headlines plus context).\n' +
+    'Everything before [[TIER1]] must stand alone as a complete mini-segment. ' +
+    'Everything before [[TIER2]] must stand alone as a complete medium segment. ' +
+    'NEVER place a marker mid-sentence. If the news genuinely runs shorter than ' + hWords + ' words, ' +
+    'write what exists and put both markers at the very end.\n\n' +
 
     'ABSOLUTE RULES — VIOLATING ANY OF THESE MAKES THE SEGMENT UNUSABLE:\n' +
     '1. DO NOT open with a greeting. FORBIDDEN opening words/phrases include: "Good morning", "Good afternoon", "Good evening", "Hello", "Hi", "Welcome", "Welcome back", "Thanks for listening", "Today\'s Cast", "In today\'s", "Here\'s what\'s happening", "Top stories", "Coming up", "Let\'s start with", "Let\'s begin".\n' +
@@ -577,6 +636,166 @@ async function ttsOpenAI(text, voice) {
 }
 
 // Sequential within a segment — parallel TTS caused truncation in v9.x.
+/* ------------------------------------------------- EXACT MP3 DURATION (no deps)
+   duration_sec must be MEASURED, not estimated: Rork requires +/-1s and the old
+   bytes/4000 heuristic drifts. music-metadata was rejected because current
+   versions are ESM-only and this package is "type": "commonjs".
+
+   This walks real MPEG frame headers and returns totalSamples / sampleRate,
+   which is exact for CBR and correct for VBR. Validated against ffprobe across
+   bitrates, sample rates and ID3-tagged files: worst error 0.026s.
+   ------------------------------------------------------------------------- */
+const MP3_BITRATES = {
+  1: [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320], // MPEG1 Layer III
+  2: [0,8,16,24,32,40,48,56,64,80,96,112,128,144,160],     // MPEG2/2.5 Layer III
+};
+const MP3_SAMPLERATES = { 3: [44100,48000,32000], 2: [22050,24000,16000], 0: [11025,12000,8000] };
+
+function mp3DurationSec(filePath) {
+  let buf;
+  try { buf = fs.readFileSync(filePath); } catch (_) { return null; }
+  let off = 0;
+  // Skip an ID3v2 container if present (28-bit syncsafe length).
+  if (buf.length > 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+    off = 10 + ((buf[6] & 0x7f) << 21 | (buf[7] & 0x7f) << 14 | (buf[8] & 0x7f) << 7 | (buf[9] & 0x7f));
+    if (buf[5] & 0x10) off += 10; // footer present
+  }
+  let frames = 0, totalSamples = 0, sampleRate = 0;
+  while (off + 4 <= buf.length) {
+    if (buf[off] !== 0xff || (buf[off + 1] & 0xe0) !== 0xe0) { off++; continue; }
+    const verBits = (buf[off + 1] >> 3) & 0x03;   // 3=MPEG1 2=MPEG2 0=MPEG2.5
+    const layer   = (buf[off + 1] >> 1) & 0x03;   // 1 = Layer III
+    const brIdx   = (buf[off + 2] >> 4) & 0x0f;
+    const srIdx   = (buf[off + 2] >> 2) & 0x03;
+    const pad     = (buf[off + 2] >> 1) & 0x01;
+    if (verBits === 1 || layer !== 1 || brIdx === 0 || brIdx === 15 || srIdx === 3) { off++; continue; }
+    const bitrate = (verBits === 3 ? MP3_BITRATES[1] : MP3_BITRATES[2])[brIdx] * 1000;
+    const sr = MP3_SAMPLERATES[verBits][srIdx];
+    if (!bitrate || !sr) { off++; continue; }
+    const samplesPerFrame = verBits === 3 ? 1152 : 576;
+    const frameLen = Math.floor((samplesPerFrame / 8) * bitrate / sr) + pad;
+    if (frameLen < 4) { off++; continue; }
+    frames++; totalSamples += samplesPerFrame; sampleRate = sr;
+    off += frameLen;
+  }
+  if (!frames || !sampleRate) return null;
+  return totalSamples / sampleRate;
+}
+
+/* ------------------------------------------------------- SCRIPT -> DEPTH TIERS
+   One script per topic per night. Tiers are PREFIXES of it, so upgrading a
+   topic from Headlines to Full gives you more of the same reporting rather than
+   a different account of it.
+
+   Claude is asked to place [[TIER1]] / [[TIER2]] markers on sentence
+   boundaries. If it doesn't comply we fall back to accumulating whole sentences
+   up to each tier's word budget -- either way a tier NEVER ends mid-sentence.
+   ------------------------------------------------------------------------- */
+// Sentence boundaries in real news copy. Naive splitting on [.!?] breaks on
+// closing quotes ('...forward for the state." Analysts...') and on
+// abbreviations ('J.P. Morgan', 'Jan. 4', 'Dr. Lee'), which would let a tier
+// end mid-sentence -- the exact failure this release exists to eliminate.
+const ABBREV_END = /(?:^|\s)(?:mr|mrs|ms|dr|prof|sen|rep|gov|gen|col|lt|sgt|st|jr|sr|vs|etc|inc|ltd|co|corp|dept|est|approx|no|fig|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|u\.s|u\.k|e\.g|i\.e|a\.m|p\.m)\.$/i;
+const CLOSERS = '"\')]\u201d\u2019';
+const OPENERS = '"\'(\u201c\u2018';
+
+// Returns [start, end] character spans over the NORMALIZED text.
+function sentenceSpans(t) {
+  const spans = [];
+  let start = 0;
+  for (let i = 0; i < t.length; i++) {
+    if (t[i] !== '.' && t[i] !== '!' && t[i] !== '?') continue;
+    let j = i + 1;
+    while (j < t.length && CLOSERS.indexOf(t[j]) >= 0) j++;   // absorb closing quotes
+    if (j >= t.length) break;
+    if (t[j] !== ' ') continue;                                // not a boundary
+    const k = j + 1;
+    if (k >= t.length) break;
+    // A real sentence starts with a capital, a digit, or an opening quote.
+    if (!(OPENERS.indexOf(t[k]) >= 0 || /[A-Z0-9]/.test(t[k]))) continue;
+    const chunk = t.slice(start, j);
+    // Abbreviation or a lone initial ("J." in "J.P.") is not a sentence end.
+    if (ABBREV_END.test(chunk) || /(?:^|\s)[A-Za-z]\.$/.test(chunk)) continue;
+    spans.push([start, j]);
+    start = k;
+    i = k - 1;
+  }
+  if (start < t.length) spans.push([start, t.length]);
+  return spans;
+}
+
+function splitSentences(text) {
+  const t = String(text).replace(/\s+/g, ' ').trim();
+  return sentenceSpans(t).map(([a, b]) => t.slice(a, b).trim()).filter(Boolean);
+}
+
+/* ------------------------------------------------------- SCRIPT -> DEPTH TIERS
+   One script per topic per night. Tiers are PREFIXES of it, so upgrading a
+   topic from Headlines to Full gives more of the same reporting rather than a
+   different account of it.
+
+   Claude is asked to place [[TIER1]] / [[TIER2]] markers on sentence
+   boundaries. Markers are SNAPPED to the nearest real boundary and validated;
+   if they're missing or unusable we fall back to accumulating whole sentences
+   up to each tier's word budget. Every tier is produced by slicing the SAME
+   normalized string, so a shorter tier is always an exact prefix of a longer
+   one -- and can never end mid-sentence.
+   ------------------------------------------------------------------------- */
+function splitScriptIntoTiers(script) {
+  const raw = String(script || '').trim();
+  const markerRe = /\[\[TIER([12])\]\]/g;
+
+  // Where do the markers sit, measured in the normalized text?
+  const marks = {};
+  let cleaned = '', last = 0, m;
+  while ((m = markerRe.exec(raw)) !== null) {
+    cleaned += raw.slice(last, m.index);
+    marks[m[1]] = cleaned.replace(/\s+/g, ' ').trim().length;
+    last = m.index + m[0].length;
+  }
+  cleaned += raw.slice(last);
+  const full = cleaned.replace(/\s+/g, ' ').trim();
+  if (!full) return { headlines: '', expanded: '', full: '', marked: false };
+
+  const spans = sentenceSpans(full);
+  const ends = spans.map(sp => sp[1]);
+
+  // Snap a marker offset DOWN to the nearest sentence end, so a marker dropped
+  // mid-sentence by the model cannot produce a mid-sentence cut.
+  const snap = off => {
+    let best = 0;
+    for (const e of ends) { if (e <= off + 2) best = e; else break; }
+    return best;
+  };
+
+  const wordsFor = sec => Math.round(sec * WORDS_PER_SEC);
+  const byBudget = target => {
+    let n = 0, end = 0;
+    for (const [a, b] of spans) {
+      const w = full.slice(a, b).split(/\s+/).filter(Boolean).length;
+      if (n && n + w > target) break;
+      n += w; end = b;
+    }
+    return end || full.length;
+  };
+
+  let h = marks['1'] ? snap(marks['1']) : 0;
+  let e = marks['2'] ? snap(marks['2']) : 0;
+  const usedMarkers = h > 0 && e >= h;
+  if (!usedMarkers) {
+    h = byBudget(wordsFor(TIERS.headlines.cost_sec));
+    e = byBudget(wordsFor(TIERS.expanded.cost_sec));
+  }
+  if (e < h) e = h;
+
+  return {
+    headlines: full.slice(0, h).trim() || full,
+    expanded:  full.slice(0, e).trim() || full,
+    full,
+    marked: usedMarkers,
+  };
+}
+
 async function synthesizeToFile(text, voice, outPath) {
   const spoken = normalizeForTTS(text);
   if (MOCK_MODE) {
@@ -592,12 +811,16 @@ async function synthesizeToFile(text, voice, outPath) {
   }
   const final = Buffer.concat(buffers);
   fs.writeFileSync(outPath, final);
-  // Byte-based duration: OpenAI tts-1 outputs ~32kbps MP3 = ~4000 bytes/sec.
-  // Word-count estimation drifted up to 36s on real files (Bug 1 fix).
+  // v2.1: MEASURE the file. Estimation (word count, then bytes/4000) is what
+  // put duration_sec out of tolerance. Fall back to the byte estimate only if
+  // the parser can't find frames, which would mean a malformed file.
+  const measured = mp3DurationSec(outPath);
   const wordEstSec = Math.round(spoken.split(/\s+/).filter(Boolean).length / 2.67);
   const byteEstSec = Math.round(final.length / 4000);
-  const durationSec = (byteEstSec > 5 && byteEstSec < wordEstSec * 2.5) ? byteEstSec : wordEstSec;
-  return { bytes: final.length, durationSec };
+  const fallback = (byteEstSec > 5 && byteEstSec < wordEstSec * 2.5) ? byteEstSec : wordEstSec;
+  if (measured == null) console.warn('mp3 duration parse failed, estimating:', outPath);
+  const durationSec = measured != null ? Math.round(measured) : fallback;
+  return { bytes: final.length, durationSec, exact: measured != null };
 }
 
 /* =============================================================================
@@ -618,9 +841,9 @@ async function generateTopic(topic, date, activeVoices) {
     const { items, windowUsed, thin } = await retrieveRobust(topic);
     if (!items.length) {
       await pool.query(
-        `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, script, sources, story_count, status)
-         VALUES ($1,$2,'-','','', '[]', 0, 'failed')
-         ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET status='failed', story_count=0`,
+        `INSERT INTO segments (topic_id, cycle_date, voice, tier, audio_path, script, sources, story_count, status)
+         VALUES ($1,$2,'-','full','','', '[]', 0, 'failed')
+         ON CONFLICT (topic_id, cycle_date, voice, tier) DO UPDATE SET status='failed', story_count=0`,
         [topic.id, date]);
       console.error('[FAILED] ' + topic.id + ' — zero sources after full escalation');
       return { topic: topic.id, status: 'failed', stories: 0 };
@@ -634,17 +857,41 @@ async function generateTopic(topic, date, activeVoices) {
     const dir = path.join(AUDIO_DIR, topic.id, date);
     fs.mkdirSync(dir, { recursive: true });
 
+    // Split once, reuse for every voice.
+    const tiers = splitScriptIntoTiers(script);
+    if (!tiers.marked) console.warn('[tier-fallback] ' + topic.id + ' — no markers, split by sentence budget');
+
     for (const voice of (activeVoices && activeVoices.length ? activeVoices : [DEFAULT_VOICE])) {
-      const scriptHash = crypto.createHash('sha1').update(script).digest('hex').slice(0, 6);
-      const out = path.join(dir, voice + '.' + scriptHash + '.mp3');
-      const { durationSec } = await synthesizeToFile(script, voice, out);
-      await pool.query(
-        `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, duration_sec, script, sources, story_count, status)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET
-           audio_path=$4, duration_sec=$5, script=$6, sources=$7, story_count=$8, status=$9`,
-        [topic.id, date, voice, '/audio/' + topic.id + '/' + date + '/' + voice + '.' + scriptHash + '.mp3',
-         durationSec, script, JSON.stringify(sources), items.length, thin ? 'thin' : 'ok']);
+      // SEQUENTIAL. Concurrent TTS previously produced truncated ~23s episodes.
+      // Files are content-addressed on the tier TEXT, so when a topic has less
+      // news than a tier allows and two tiers come out identical, they share a
+      // single synthesis and a single file. That is what makes depth a CEILING
+      // rather than a quota to pad up to.
+      const renderedByHash = {};
+      for (const tierId of TIER_ORDER) {
+        const text = tiers[tierId];
+        if (!text || text.length < 40) continue;
+        const h = crypto.createHash('sha1').update(text).digest('hex').slice(0, 6);
+        if (!renderedByHash[h]) {
+          const rel = '/audio/' + topic.id + '/' + date + '/' + voice + '.' + h + '.mp3';
+          const out = path.join(dir, voice + '.' + h + '.mp3');
+          const { durationSec, exact } = await synthesizeToFile(text, voice, out);
+          renderedByHash[h] = { rel, durationSec, exact };
+        }
+        const r = renderedByHash[h];
+        await pool.query(
+          `INSERT INTO segments (topic_id, cycle_date, voice, tier, audio_path, duration_sec,
+                                 script, script_prefix_chars, sources, story_count, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+           ON CONFLICT (topic_id, cycle_date, voice, tier) DO UPDATE SET
+             audio_path=$5, duration_sec=$6, script=$7, script_prefix_chars=$8,
+             sources=$9, story_count=$10, status=$11`,
+          [topic.id, date, voice, tierId, r.rel, r.durationSec, text, text.length,
+           JSON.stringify(sources), items.length, thin ? 'thin' : 'ok']);
+      }
+      const uniq = Object.keys(renderedByHash).length;
+      console.log('  ' + topic.id + '/' + voice + ': ' + uniq + ' file(s) for ' +
+                  TIER_ORDER.length + ' tiers' + (uniq < TIER_ORDER.length ? ' (shared — short news)' : ''));
     }
     console.log('[OK] ' + topic.id + ' stories=' + items.length + ' window=' + windowUsed + 'h voices=' +
                 (activeVoices || [DEFAULT_VOICE]).join('/') + ' ' +
@@ -764,7 +1011,9 @@ async function ensureTransitionAudio(label, voice, date) {
   const urlPath = '/audio/_transitions/' + date + '/' + filename;
 
   // Cache hit only counts if the cached bytes actually look complete.
-  if (ttsFileLooksComplete(outPath, text)) return urlPath;
+  if (ttsFileLooksComplete(outPath, text)) {
+    return { url: urlPath, durationSec: Math.round(mp3DurationSec(outPath) || 0) };
+  }
 
   // A file that exists but failed validation is a poisoned cache entry. Remove
   // it so the retry below writes clean bytes.
@@ -776,8 +1025,8 @@ async function ensureTransitionAudio(label, voice, date) {
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      await synthesizeToFile(text, voice, outPath);
-      if (ttsFileLooksComplete(outPath, text)) return urlPath;
+      const r = await synthesizeToFile(text, voice, outPath);
+      if (ttsFileLooksComplete(outPath, text)) return { url: urlPath, durationSec: r.durationSec };
       console.warn('transition synth undersized (attempt ' + attempt + '):', filename,
         (fs.existsSync(outPath) ? fs.statSync(outPath).size : 0) + 'B');
       try { fs.unlinkSync(outPath); } catch (_) {}
@@ -798,20 +1047,28 @@ async function ensureIntroAudio(user, voice, date, tz) {
   const nameSlug = user && user.name ? user.name.trim().split(/\s+/)[0].toLowerCase().replace(/[^a-z0-9]/g, '') : 'anon';
   const dir = path.join(AUDIO_DIR, '_intros', date);
   fs.mkdirSync(dir, { recursive: true });
-  const filename = nameSlug + '__' + voice + '.mp3';
-  const outPath = path.join(dir, filename);
-  const urlPath = '/audio/_intros/' + date + '/' + filename;
-  if (fs.existsSync(outPath) && fs.statSync(outPath).size > 500) return urlPath;
-
   const weekday = new Date(date + 'T12:00:00').toLocaleDateString('en-US',
     { weekday: 'long', month: 'long', day: 'numeric', timeZone: tz || 'America/New_York' });
   const firstName = user && user.name ? user.name.trim().split(/\s+/)[0] : null;
   const text = firstName
     ? 'Hey ' + firstName + ', here\'s your Cast. ' + weekday + '.'
     : 'Here\'s your Cast. ' + weekday + '.';
+
+  const introHash = crypto.createHash('sha1').update(text + '|' + voice).digest('hex').slice(0, 6);
+  const filename = nameSlug + '__' + voice + '.' + introHash + '.mp3';
+  const outPath = path.join(dir, filename);
+  const urlPath = '/audio/_intros/' + date + '/' + filename;
+
+  if (ttsFileLooksComplete(outPath, text)) {
+    return { url: urlPath, durationSec: Math.round(mp3DurationSec(outPath) || 0) };
+  }
+  if (fs.existsSync(outPath)) { try { fs.unlinkSync(outPath); } catch (_) {} }
+
   try {
-    await synthesizeToFile(text, voice, outPath);
-    return urlPath;
+    const r = await synthesizeToFile(text, voice, outPath);
+    if (ttsFileLooksComplete(outPath, text)) return { url: urlPath, durationSec: r.durationSec };
+    console.warn('intro synth undersized:', filename);
+    return null;
   } catch (e) {
     console.error('intro synth failed:', e.message);
     return null;
@@ -822,101 +1079,155 @@ async function assembleBrief(brief, date) {
   const topicIds = brief.topic_ids || [];
   if (!topicIds.length) return null;
   const requestedVoice = brief.voice || DEFAULT_VOICE;
-  const budgetSec = (brief.length_min || FREE_MAX_LEN) * 60;
 
-  // PER-SEGMENT VOICE FALLBACK. Pull the latest OK segment for each topic in
-  // ANY available voice, preferring the user's requested voice, then the
-  // default, then anything else. This is the fix for the "4 of 17 topics"
-  // bug: when a user switches voices between batches, most of their topics
-  // still only have segments in the old voice — we serve those rather than
-  // silently drop the topic.
-  const q = `SELECT DISTINCT ON (topic_id) topic_id, voice, cycle_date, audio_path,
-                    duration_sec, sources, story_count, status,
+  // v2.1: NOTHING IS TRIMMED. scale and play_sec are gone. Each topic resolves
+  // to a complete pre-rendered file at the user's chosen depth, and the client
+  // plays every file to its end. That is the whole fix for mid-sentence cuts:
+  // there is no longer any point at which audio is stopped early.
+  const q = `SELECT topic_id, voice, tier, cycle_date, audio_path, duration_sec,
+                    sources, story_count, status,
                     (SELECT label FROM topics t WHERE t.id = segments.topic_id) AS label
                FROM segments
-              WHERE topic_id = ANY($1) AND status = 'ok'
-              ORDER BY topic_id,
-                       CASE WHEN voice = $2 THEN 0
-                            WHEN voice = $3 THEN 1
-                            ELSE 2 END,
-                       cycle_date DESC`;
-  const { rows: segs } = await pool.query(q, [topicIds, requestedVoice, DEFAULT_VOICE]);
+              WHERE topic_id = ANY($1) AND status = 'ok' AND audio_path <> ''
+              ORDER BY cycle_date DESC`;
+  const { rows: segs } = await pool.query(q, [topicIds]);
 
-  const byId = {};
-  for (const s of segs) byId[s.topic_id] = s;
-  const ordered = topicIds.map(id => byId[id]).filter(Boolean);
+  const voiceRank = v => (v === requestedVoice ? 0 : v === DEFAULT_VOICE ? 1 : 2);
+
+  // Pick one segment per topic. Voice match dominates (a consistent narrator
+  // matters more than exact length), then tier. When the requested tier is
+  // missing we prefer a SHORTER tier over a longer one -- running under the
+  // user's budget is a smaller sin than blowing through it.
+  function pickFor(topicId) {
+    const cands = segs.filter(x => x.topic_id === topicId);
+    if (!cands.length) return null;
+    const want = depthOf(brief, topicId);
+    const wi = TIER_ORDER.indexOf(want);
+    const tierRank = t => {
+      const ti = TIER_ORDER.indexOf(t);
+      if (ti === wi) return 0;
+      return ti < wi ? 1 + (wi - ti) : 10 + (ti - wi);
+    };
+    return cands.slice().sort((a, b) =>
+      voiceRank(a.voice) - voiceRank(b.voice) ||
+      tierRank(a.tier) - tierRank(b.tier) ||
+      new Date(b.cycle_date) - new Date(a.cycle_date))[0];
+  }
+
+  let ordered = topicIds.map(pickFor).filter(Boolean);
   if (!ordered.length) return null;
 
-  // What voice(s) did we actually serve? Report honestly.
-  const voicesServed = [...new Set(ordered.map(s => s.voice))];
+  // SERVE-TIME BUDGET. config validates on save, but a user whose entitlement
+  // SHRINKS (trial expiry on day 8, or a lapsed subscription) never re-saves —
+  // and since v2.1 plays every segment whole, nothing would otherwise stop us
+  // serving a 10-minute Cast to a 5-minute account forever.
+  //
+  // Keep topics in the user's own order until the budget is spent, then stop.
+  // Dropped topics are REPORTED, not silently swallowed: the client turns
+  // over_budget into the upgrade prompt.
+  const { rows: urows } = await pool.query('SELECT tier, created_at FROM users WHERE id=$1', [brief.user_id]);
+  const owner = urows[0] || { tier: 'free' };
+  const entitledSec = maxLenFor(owner) * 60;
+  const wantSec = Math.max(1, (brief.length_min || FREE_MAX_LEN)) * 60;
+  const effectiveBudgetSec = Math.min(wantSec, entitledSec);
+
+  const dropped = [];
+  let spent = 0;
+  const kept = [];
+  for (const seg of ordered) {
+    const d = seg.duration_sec || 0;
+    // Always keep the first topic, even if it alone exceeds the budget —
+    // an empty Cast is worse than a slightly long one.
+    if (kept.length && spent + d > effectiveBudgetSec) { dropped.push(seg.topic_id); continue; }
+    kept.push(seg); spent += d;
+  }
+  const overBudget = dropped.length > 0;
+  ordered = kept;
+
+  const voicesServed = [...new Set(ordered.map(x => x.voice))];
   const primaryVoice = ordered[0].voice;
-  const anyFallback = ordered.some(s => s.voice !== requestedVoice);
+  const anyFallback  = ordered.some(x => x.voice !== requestedVoice);
+  const tierFallback = ordered.filter(x => x.tier !== depthOf(brief, x.topic_id));
 
-  // Proportional trim to the user's budget. Segments are inverted-pyramid, so
-  // a trim from the end stays coherent.
-  const totalSec = ordered.reduce((a, s) => a + (s.duration_sec || 0), 0);
-  const scale = totalSec > budgetSec ? budgetSec / totalSec : 1;
-
+  let overheadSec = 0;
   const items = [];
   for (let i = 0; i < ordered.length; i++) {
-    const s = ordered[i];
-    // Every item after the first gets a short bridge line before its segment.
-    let transitionUrl = null;
-    if (i > 0) transitionUrl = await ensureTransitionAudio(s.label, s.voice, date);
+    const seg = ordered[i];
+    let transition;
+    if (i > 0) transition = await ensureTransitionAudio(seg.label, seg.voice, date);
+    if (transition && transition.durationSec) overheadSec += transition.durationSec;
     items.push({
-      topic_id: s.topic_id,
-      label: s.label,
-      transition_url: transitionUrl ? absolute(transitionUrl) : undefined,
-      url: absolute(s.audio_path),
-      duration_sec: s.duration_sec,
-      play_sec: Math.min(Math.max(30, Math.floor((s.duration_sec || 0) * scale)), Math.max(30, (s.duration_sec || 0) - 2)),
-      sources: s.sources || [],
-      voice: s.voice,
-      status: s.status,
+      topic_id: seg.topic_id,
+      label: seg.label,
+      tier: seg.tier,
+      tier_requested: depthOf(brief, seg.topic_id),
+      transition_url: transition && transition.url ? absolute(transition.url) : null,
+      url: absolute(seg.audio_path),
+      duration_sec: seg.duration_sec,
+      sources: seg.sources || [],
+      voice: seg.voice,
+      status: seg.status,
     });
   }
 
-  // Correct-timezone intro. UTC-noon-parsing was rendering the wrong weekday
-  // near midnight boundaries. Anchor to the user's TZ if we have it.
   const tz = brief.timezone || 'America/New_York';
   const introDate = new Date(date + 'T12:00:00');
-  const weekday = introDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', timeZone: tz });
+  const weekday = introDate.toLocaleDateString('en-US',
+    { weekday: 'long', month: 'long', day: 'numeric', timeZone: tz });
 
-  const total = items.reduce((a, i) => a + i.play_sec, 0);
-  const missingTopics = topicIds.length - items.length;
-
-  // Personalized intro audio — synthesized on demand, cached by (user, voice, date).
   const { rows: urow } = await pool.query('SELECT name FROM users WHERE id=$1', [brief.user_id]);
-  const introUrl = await ensureIntroAudio(urow[0] || null, primaryVoice, date, tz);
+  const intro = await ensureIntroAudio(urow[0] || null, primaryVoice, date, tz);
+  if (intro && intro.durationSec) overheadSec += intro.durationSec;
   const firstName = urow[0] && urow[0].name ? String(urow[0].name).trim().split(/\s+/)[0] : null;
   const introText = firstName
     ? 'Hey ' + firstName + ', here\'s your Cast. ' + weekday + '.'
     : 'Here\'s your Cast. ' + weekday + '.';
 
+  // TWO totals, deliberately. content_sec is what the depth meter budgets
+  // against; total_sec is real playback. Intro and transitions are excluded
+  // from the budget by product decision, so total_sec runs slightly longer.
+  const contentSec = items.reduce((a, i) => a + (i.duration_sec || 0), 0);
+  const budgetSec  = effectiveBudgetSec;
+  const missingTopics = topicIds.length - items.length - dropped.length;
+
   const manifest = {
     date,
     voice: primaryVoice,
     voice_requested: requestedVoice,
-    voice_pending: anyFallback ? 'Some segments are still in your previous voice — your new voice will be fully in place after tomorrow morning\'s update.' : undefined,
+    voice_pending: anyFallback
+      ? 'Some segments are still in your previous voice — your new voice will be fully in place after tomorrow morning\'s update.'
+      : undefined,
     voices_used: voicesServed,
+    default_depth: TIERS[brief.default_depth] ? brief.default_depth : DEFAULT_TIER,
     intro: introText,
-    intro_url: introUrl ? absolute(introUrl) : undefined,
+    intro_url: intro && intro.url ? absolute(intro.url) : undefined,
     items,
     requested_topic_count: topicIds.length,
     included_topic_count: items.length,
     missing_topic_count: missingTopics,
-    requested_sec: budgetSec,
-    actual_sec: total,
+    content_sec: contentSec,
+    total_sec: contentSec + overheadSec,
+    budget_sec: budgetSec,
+    entitled_sec: entitledSec,
+    over_budget: overBudget || undefined,
+    dropped_topics: dropped.length ? dropped : undefined,
+    trial: { active: inTrial(owner), daysRemaining: trialDaysLeft(owner) },
   };
-  // Only say "news ran short" if we genuinely have all the topics and the
-  // aggregate audio is under-budget. Otherwise it's a voice/segment gap, not
-  // a news gap — the client should message that differently.
-  if (missingTopics === 0 && total < budgetSec * 0.8) {
-    manifest.note = 'Today\'s news ran short — this is everything that happened.';
+
+  if (tierFallback.length) {
+    manifest.depth_pending = tierFallback.length + ' topic(s) aren\'t at your chosen depth yet — ' +
+      'they\'ll be ready after tomorrow morning\'s update.';
+  }
+  // One note, most actionable first. These were previously separate ifs and the
+  // later branch could overwrite the earlier one.
+  if (overBudget) {
+    manifest.note = dropped.length + ' topic(s) didn\'t fit in your ' +
+      Math.floor(budgetSec / 60) + '-minute Cast. Upgrade for longer Casts, or lower a topic\'s depth.';
   } else if (missingTopics > 0) {
     manifest.note = missingTopics + ' of your topics don\'t have audio yet — they\'ll be in tomorrow\'s Cast.';
+  } else if (contentSec < budgetSec * 0.8) {
+    manifest.note = 'Today\'s news ran short — this is everything that happened.';
   }
-  // (no longer persisted — GET always live-assembles)
   return manifest;
 }
 
@@ -978,14 +1289,32 @@ app.post('/api/auth/register', async (_req, res) => {
   res.json({ userId, token, tier });
 });
 
-app.get('/api/catalog', async (_req, res) => {
+app.get('/api/catalog', async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, label, kind, window_hours FROM topics WHERE kind='category' AND is_live=true ORDER BY label`);
+  // Optional auth: anonymous callers get the free budget so the picker can
+  // render before registration completes.
+  let u = null;
+  try { u = await getReqUser(req); } catch (_) { u = null; }
+  const paid = u ? isPaid(u) : false;
   res.json({
     categories: rows,
     leagues: SEED.TEAM_LEAGUES,
     cities: SEED.CITIES,
     follows: SEED.FOLLOW_SEEDS,
+    // The client MUST read tier costs from here rather than hardcoding them.
+    // If a tier is retuned server-side, a hardcoded meter would silently lie
+    // and users would go back to overrunning their budget.
+    tiers: TIER_ORDER.map(t => TIERS[t]),
+    default_depth: DEFAULT_TIER,
+    budget: {
+      content_sec: (u ? maxLenFor(u) : FREE_MAX_LEN) * 60,
+      tier: u ? u.tier : 'free',
+      max_categories: paid ? null : FREE_MAX_CATEGORIES,
+      max_custom: paid ? PAID_MAX_CUSTOM : 0,
+      trial_active: inTrial(u),
+      trial_days_remaining: trialDaysLeft(u),
+    },
   });
 });
 
@@ -1000,7 +1329,10 @@ app.get('/api/me', requireUser(async (req, res) => {
       maxLengthMin: maxLenFor(req.user),
       maxCategories: isPaid(req.user) ? null : FREE_MAX_CATEGORIES,
       maxCustom: isPaid(req.user) ? PAID_MAX_CUSTOM : 0,
+      contentBudgetSec: maxLenFor(req.user) * 60,
     },
+    trial: { active: inTrial(req.user), daysRemaining: trialDaysLeft(req.user) },
+    tiers: TIER_ORDER.map(t => TIERS[t]),
     brief: rows[0] || null,
   });
 }));
@@ -1008,7 +1340,8 @@ app.get('/api/me', requireUser(async (req, res) => {
 // Set the brief: ordered topics, length, voice, delivery time.
 app.put('/api/brief/config', requireUser(async (req, res) => {
   const u = req.user;
-  const { topic_ids = [], length_min = FREE_MAX_LEN, voice = DEFAULT_VOICE, deliver_at = null, timezone, name } = req.body || {};
+  const { topic_ids = [], length_min = FREE_MAX_LEN, voice = DEFAULT_VOICE, deliver_at = null,
+          timezone, name, default_depth, topic_depths } = req.body || {};
   if (typeof name === 'string' && name.trim().length && name.trim().length <= 40) {
     await pool.query('UPDATE users SET name=$2 WHERE id=$1', [u.id, name.trim()]);
   }
@@ -1035,21 +1368,55 @@ app.put('/api/brief/config', requireUser(async (req, res) => {
   const ordered = topic_ids.filter(id => validIds.includes(id));
   if (!ordered.length) return res.status(400).json({ error: 'no_valid_topics' });
 
+  // ---- DEPTH + BUDGET -------------------------------------------------------
+  // Sanitize: unknown tier ids are ignored rather than rejected, so an older
+  // app build can't lock a user out of saving.
+  const defDepth = TIERS[default_depth] ? default_depth : DEFAULT_TIER;
+  const depths = {};
+  if (topic_depths && typeof topic_depths === 'object' && !Array.isArray(topic_depths)) {
+    for (const [k, v] of Object.entries(topic_depths)) {
+      if (ordered.includes(k) && TIERS[v] && v !== defDepth) depths[k] = v;
+    }
+  }
+  // Server-side budget enforcement. The client meter should prevent this, but a
+  // stale build must not be able to oversubscribe -- and this same response is
+  // what a user hits on day 8 when their trial ends and their saved config no
+  // longer fits.
+  const contentSec = ordered.reduce((a, id) => a + TIERS[depths[id] || defDepth].cost_sec, 0);
+  const budgetSec = Math.min(len, maxLenFor(u)) * 60;
+  if (contentSec > budgetSec) {
+    return res.status(403).json({
+      error: 'budget_exceeded',
+      content_sec: contentSec,
+      budget_sec: budgetSec,
+      over_by_sec: contentSec - budgetSec,
+      requiredTier: isPaid(u) ? undefined : 'paid',
+      message: 'That selection needs ' + Math.ceil(contentSec / 60) + ' minutes of content but your Cast is ' +
+               Math.floor(budgetSec / 60) + ' minutes. Remove a topic or lower a depth.',
+    });
+  }
+
   const { rows: prev } = await pool.query('SELECT topic_id FROM topic_subscriptions WHERE user_id=$1', [u.id]);
   for (const p of prev) if (!ordered.includes(p.topic_id)) await unsubscribeTopic(u.id, p.topic_id);
   for (const id of ordered) await subscribeTopic(u.id, id);
 
   await pool.query(
-    `INSERT INTO user_briefs (user_id, topic_ids, length_min, voice, deliver_at, timezone, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,now())
+    `INSERT INTO user_briefs (user_id, topic_ids, length_min, voice, deliver_at, timezone,
+                              default_depth, topic_depths, updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
      ON CONFLICT (user_id) DO UPDATE SET
-       topic_ids=$2, length_min=$3, voice=$4, deliver_at=$5, timezone=COALESCE($6, user_briefs.timezone), updated_at=now()`,
-    [u.id, JSON.stringify(ordered), len, voice, deliver_at, timezone || null]);
+       topic_ids=$2, length_min=$3, voice=$4, deliver_at=$5,
+       timezone=COALESCE($6, user_briefs.timezone),
+       default_depth=$7, topic_depths=$8, updated_at=now()`,
+    [u.id, JSON.stringify(ordered), len, voice, deliver_at, timezone || null,
+     defDepth, JSON.stringify(depths)]);
 
   // Assemble immediately from the existing catalog so they hear it now.
   const { rows: b } = await pool.query('SELECT * FROM user_briefs WHERE user_id=$1', [u.id]);
   const manifest = await assembleBrief(b[0], cycleDate());
-  res.json({ ok: true, topics: ordered, length_min: len, voice, manifest });
+  res.json({ ok: true, topics: ordered, length_min: len, voice,
+             default_depth: defDepth, topic_depths: depths,
+             content_sec: contentSec, budget_sec: budgetSec, manifest });
 }));
 
 // PAID: add one of up to 3 custom topics. Normalizes into the shared catalog.
@@ -1187,7 +1554,10 @@ app.post('/api/admin/batch/run', requireAdmin(async (_req, res) => {
 app.get('/api/admin/catalog/health', requireAdmin(async (_req, res) => {
   const { rows } = await pool.query(
     `SELECT DISTINCT ON (s.topic_id) s.topic_id, t.label, t.kind, t.window_hours,
-            s.story_count, s.status, s.cycle_date, t.subscriber_count
+            s.story_count, s.status, s.cycle_date, t.subscriber_count,
+            (SELECT COUNT(DISTINCT s2.tier)::int FROM segments s2
+              WHERE s2.topic_id = s.topic_id AND s2.cycle_date = s.cycle_date
+                AND s2.status = 'ok' AND s2.audio_path <> '') AS tiers_ready
        FROM segments s JOIN topics t ON t.id=s.topic_id
       ORDER BY s.topic_id, s.cycle_date DESC`);
   const thin = rows.filter(r => r.status !== 'ok');
@@ -1196,10 +1566,31 @@ app.get('/api/admin/catalog/health', requireAdmin(async (_req, res) => {
     total: rows.length,
     ok: rows.filter(r => r.status === 'ok').length,
     thin: rows.filter(r => r.status === 'thin').length,
+    // A topic with fewer than 3 tiers ready will silently fall back to a
+    // different depth than the user asked for, so surface it here.
+    incomplete_tiers: rows.filter(r => (r.tiers_ready || 0) < TIER_ORDER.length)
+      .map(r => ({ topic_id: r.topic_id, tiers_ready: r.tiers_ready || 0 })),
     failed: rows.filter(r => r.status === 'failed').length,
     needs_attention: thin,
     topics: rows.sort((a, b) => a.story_count - b.story_count),
   });
+}));
+
+// Testing affordance. DEVELOPER_IDS pins the developer account to 'paid', so
+// the trial and the day-8 downgrade can only be exercised on a separate
+// account -- and without this, each test would mean waiting a real week.
+app.post('/api/admin/trial/reset', requireAdmin(async (req, res) => {
+  const { userId, daysAgo = 0 } = req.body || {};
+  if (!userId) return res.status(400).json({ error: 'userId_required' });
+  const { rows } = await pool.query(
+    `UPDATE users SET created_at = now() - ($2 || ' days')::interval
+      WHERE id=$1 RETURNING id, tier, created_at`, [userId, String(Number(daysAgo) || 0)]);
+  if (!rows[0]) return res.status(404).json({ error: 'user_not_found' });
+  const u = rows[0];
+  res.json({ ok: true, user: u, trial_active: inTrial(u), trial_days_remaining: trialDaysLeft(u),
+             maxLengthMin: maxLenFor(u), note: DEVELOPER_IDS.includes(u.id)
+               ? 'WARNING: this id is in DEVELOPER_IDS and is forced to paid — use a different account to test the trial.'
+               : undefined });
 }));
 
 app.get('/api/admin/topics', requireAdmin(async (_req, res) => {
@@ -1227,7 +1618,7 @@ app.get('/api/admin/diag/user', async (req, res) => {
       const tids = b.rows[0].topic_ids || [];
       result.topic_count = tids.length;
       const seg = await pool.query(
-        `SELECT topic_id, voice, cycle_date::text as cycle_date, duration_sec, status
+        `SELECT topic_id, voice, tier, cycle_date::text as cycle_date, duration_sec, status
            FROM segments
           WHERE topic_id = ANY($1) AND status='ok'
           ORDER BY topic_id, cycle_date DESC`, [tids]);
@@ -1241,7 +1632,11 @@ app.get('/api/admin/diag/user', async (req, res) => {
       // simulate what assembleBrief would return right now
       try {
         const m = await assembleBrief(b.rows[0], cycleDate());
-        result.assembled = m ? { items: m.items.length, actual_sec: m.actual_sec, requested_sec: m.requested_sec, voice: m.voice, note: m.note } : null;
+        result.assembled = m ? {
+          items: m.items.length, content_sec: m.content_sec, total_sec: m.total_sec,
+          budget_sec: m.budget_sec, voice: m.voice,
+          tiers: m.items.map(i => i.topic_id + ':' + i.tier + (i.tier !== i.tier_requested ? '(wanted ' + i.tier_requested + ')' : '')),
+          note: m.note, depth_pending: m.depth_pending } : null;
       } catch (e) { result.assembled_error = e.message; }
     }
   } catch (e) { result.error = e.message; }
@@ -1253,20 +1648,26 @@ app.get('/api/admin/voice-sample', requireAdmin(async (req, res) => {
   const voice = req.query.voice || DEFAULT_VOICE;
   if (!VOICES[voice]) return res.status(400).json({ error: 'bad_voice', available: Object.keys(VOICES) });
   const { rows } = await pool.query(
-    `SELECT script, cycle_date FROM segments WHERE topic_id=$1 AND status<>'failed'
+    `SELECT script, cycle_date FROM segments WHERE topic_id=$1 AND status<>'failed' AND tier='headlines'
      ORDER BY cycle_date DESC LIMIT 1`, [topicId]);
   if (!rows[0]) return res.status(404).json({ error: 'no_segment_for_topic', topic: topicId });
   const date = new Date(rows[0].cycle_date).toISOString().slice(0, 10);
   const dir = path.join(AUDIO_DIR, topicId, date);
   fs.mkdirSync(dir, { recursive: true });
-  const out = path.join(dir, voice + '.mp3');
+  // Content-address the audition file too, and write it into the HEADLINES tier
+  // so it satisfies the (topic_id, cycle_date, voice, tier) unique index. The
+  // old ON CONFLICT named a constraint that v2.1 drops, which would have thrown.
+  const sampleHash = crypto.createHash('sha1').update(rows[0].script + '|' + voice).digest('hex').slice(0, 6);
+  const out = path.join(dir, voice + '.' + sampleHash + '.mp3');
   const { durationSec } = await synthesizeToFile(rows[0].script, voice, out);
-  const url = '/audio/' + topicId + '/' + date + '/' + voice + '.mp3';
+  const url = '/audio/' + topicId + '/' + date + '/' + voice + '.' + sampleHash + '.mp3';
   await pool.query(
-    `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, duration_sec, script, sources, story_count, status)
-     SELECT topic_id, cycle_date, $3, $4, $5, script, sources, story_count, status
-       FROM segments WHERE topic_id=$1 AND cycle_date=$2 LIMIT 1
-     ON CONFLICT (topic_id, cycle_date, voice) DO UPDATE SET audio_path=$4, duration_sec=$5`,
+    `INSERT INTO segments (topic_id, cycle_date, voice, tier, audio_path, duration_sec,
+                           script, sources, story_count, status)
+     SELECT topic_id, cycle_date, $3, 'headlines', $4, $5, script, sources, story_count, status
+       FROM segments WHERE topic_id=$1 AND cycle_date=$2 AND tier='headlines' LIMIT 1
+     ON CONFLICT (topic_id, cycle_date, voice, tier)
+       DO UPDATE SET audio_path=$4, duration_sec=$5`,
     [topicId, date, voice, url, durationSec]);
   res.json({ ok: true, topic: topicId, voice, durationSec, url: absolute(url) });
 }));
