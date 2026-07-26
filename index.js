@@ -545,11 +545,27 @@ function cycleDate() {
 const SEGMENT_MIN = Number(process.env.SEGMENT_MIN || 10);
 const MIN_TOPICS_FOR_LONG = Number(process.env.MIN_TOPICS_FOR_LONG || 2);
 const LONG_BRIEF_MIN = Number(process.env.LONG_BRIEF_MIN || 10);
-async function generateTopic(topic, date, activeVoices) {
+async function generateTopic(topic, date, activeVoices, globalUsedTitles) {
   const t0 = Date.now();
+  globalUsedTitles = globalUsedTitles || new Set();
   try {
-    const { items, windowUsed, thin } = await retrieveRobust(topic);
-    if (!items.length) {
+    const { items: allItems, windowUsed, thin } = await retrieveRobust(topic);
+    // Cross-topic dedup: remove stories whose titles were already used by
+    // a sibling topic in the same batch. Keeps 40% of items as a floor
+    // so a topic never starves completely due to dedup.
+    const minKeep = Math.ceil(allItems.length * 0.4);
+    const items = allItems.filter((item, idx) => {
+      const key = normTitle(item.title).slice(0, 80);
+      if (!key) return true;
+      if (globalUsedTitles.has(key) && idx >= minKeep) return false;
+      return true;
+    });
+    // Register this topic's titles so subsequent sibling topics skip them
+    for (const item of items) {
+      const key = normTitle(item.title).slice(0, 80);
+      if (key) globalUsedTitles.add(key);
+    }
+    if (!allItems.length) {
       await pool.query(
         `INSERT INTO segments (topic_id, cycle_date, voice, audio_path, script, sources, story_count, status)
          VALUES ($1,$2,'-','','', '[]', 0, 'failed')
@@ -595,7 +611,56 @@ async function runBatch() {
   const activeVoices = [...new Set([DEFAULT_VOICE, ...vrows.map(r => r.voice)])]
     .filter(v => VOICES[v]);
   console.log('active voices this cycle: ' + activeVoices.join(', '));
-  const results = await Promise.all(topics.map(t => genLimit(() => generateTopic(t, date, activeVoices))));
+
+  // Cross-topic deduplication: track story titles used across the whole batch.
+  // Topics in the same "overlap group" run sequentially so each can see what
+  // the previous topic already covered and avoid repeating those stories.
+  // Topics in different groups run in parallel as before.
+  const OVERLAP_GROUPS = [
+    ['business', 'markets_finance', 'economy', 'personal_finance'],
+    ['sports', 'nba', 'nfl', 'mlb', 'nhl', 'soccer', 'college_sports'],
+    ['technology', 'ai', 'crypto', 'cybersecurity', 'startups_vc'],
+    ['world_news', 'us_news', 'us_politics', 'elections'],
+    ['health', 'science', 'space'],
+  ];
+
+  function groupFor(topicId) {
+    for (let i = 0; i < OVERLAP_GROUPS.length; i++) {
+      if (OVERLAP_GROUPS[i].includes(topicId)) return i;
+    }
+    return -1; // no group — runs independently
+  }
+
+  // Partition topics into groups and independents
+  const grouped = {}; // groupIndex -> topics[]
+  const independent = [];
+  for (const t of topics) {
+    const g = groupFor(t.id);
+    if (g >= 0) {
+      if (!grouped[g]) grouped[g] = [];
+      grouped[g].push(t);
+    } else {
+      independent.push(t);
+    }
+  }
+
+  const results = [];
+  const globalUsedTitles = new Set(); // shared across all groups
+
+  // Run each overlap group sequentially within the group, parallel across groups
+  const groupJobs = Object.values(grouped).map(async (groupTopics) => {
+    for (const t of groupTopics) {
+      const r = await genLimit(() => generateTopic(t, date, activeVoices, globalUsedTitles));
+      results.push(r);
+    }
+  });
+
+  // Independent topics run fully in parallel
+  const indJobs = independent.map(t =>
+    genLimit(() => generateTopic(t, date, activeVoices, globalUsedTitles)).then(r => results.push(r))
+  );
+
+  await Promise.all([...groupJobs, ...indJobs]);
   const { rows: briefs } = await pool.query('SELECT COUNT(*)::int AS n FROM user_briefs');
   const userCount = briefs[0] ? briefs[0].n : 0;
   await pruneOldSegments();
